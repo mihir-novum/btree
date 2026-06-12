@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Bound;
 
 struct LeafEntry<K: Ord + Clone, V> {
     key: K,
@@ -356,6 +357,36 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
 
         value
     }
+
+    fn leftmost_leaf(node: &Node<K, V>) -> *const Leaf<K, V> {
+        match node {
+            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
+            Node::Internal(internal) => Self::leftmost_leaf(&internal.children[0]),
+        }
+    }
+
+    fn find_leaf(node: &Node<K, V>, key: &K) -> *const Leaf<K, V> {
+        match node {
+            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
+            Node::Internal(internal) => {
+                let ci = internal.child_index(key);
+                Self::find_leaf(&internal.children[ci], key)
+            }
+        }
+    }
+
+    pub fn iter(&self) -> LeafIter<'_, K, V> {
+        let leaf = Self::leftmost_leaf(&self.root);
+        LeafIter::new(leaf, 0, Bound::Unbounded)
+    }
+
+    pub fn range_from(&self, start: &K, end: Bound<K>) -> LeafIter<'_, K, V> {
+        let leaf = Self::find_leaf(&self.root, start);
+
+        let pos = unsafe { (*leaf).entries.partition_point(|e| &e.key < start) };
+
+        LeafIter::new(leaf, pos, end)
+    }
 }
 
 impl<K: Ord + Clone + fmt::Debug, V: fmt::Debug> BPlusTree<K, V> {
@@ -384,14 +415,16 @@ impl<K: Ord + Clone + fmt::Debug, V: fmt::Debug> BPlusTree<K, V> {
 pub struct LeafIter<'a, K: Ord + Clone, V> {
     current: *const Leaf<K, V>,
     pos: usize,
+    end: Bound<K>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a, K: Ord + Clone, V> LeafIter<'a, K, V> {
-    fn new(current: *const Leaf<K, V>, pos: usize) -> Self {
+    fn new(current: *const Leaf<K, V>, pos: usize, end: Bound<K>) -> Self {
         LeafIter {
             current,
             pos,
+            end,
             _marker: std::marker::PhantomData,
         }
     }
@@ -408,8 +441,29 @@ impl<'a, K: 'a + Ord + Clone, V: 'a> Iterator for LeafIter<'a, K, V> {
             let leaf = unsafe { &*self.current };
             if self.pos < leaf.entries.len() {
                 let e = &leaf.entries[self.pos];
-                self.pos += 1;
-                return Some((&e.key, &e.value));
+
+                return match &self.end {
+                    Bound::Included(key) => {
+                        if e.key <= *key {
+                            self.pos += 1;
+                            return Some((&e.key, &e.value));
+                        }
+
+                        None
+                    }
+                    Bound::Excluded(key) => {
+                        if e.key < *key {
+                            self.pos += 1;
+                            return Some((&e.key, &e.value));
+                        }
+
+                        None
+                    }
+                    Bound::Unbounded => {
+                        self.pos += 1;
+                        Some((&e.key, &e.value))
+                    }
+                };
             }
             self.current = leaf.next as *const _;
             self.pos = 0;
@@ -423,11 +477,15 @@ fn main() {
         tree.insert(i, i);
     }
 
-    println!("{:#?}", tree.search(&3u64));
+    for e in tree.iter() {
+        println!("Key: {} | Value: {}", e.0, e.1);
+    }
 
-    tree.remove(&1u64);
-    tree.remove(&2u64);
-    tree.remove(&3u64);
+    println!("Range Scan");
+
+    for range in tree.range_from(&1, Bound::Excluded(40)) {
+        println!("Key: {} | Value: {}", range.0, range.1);
+    }
 
     tree.print_tree();
 }
