@@ -86,24 +86,6 @@ struct BPlusTree<K: Ord + Clone, V> {
 }
 
 impl<K: Ord + Clone, V> BPlusTree<K, V> {
-    fn new(t: usize) -> Self {
-        assert!(t >= 2, "Minimum degree must be >= 2");
-
-        Self {
-            t,
-            root: Box::new(Node::Leaf(Leaf::new())),
-            len: 0,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     fn split_child(parent: &mut Internal<K, V>, ci: usize, t: usize) -> SplitResult<K, V> {
         match parent.children[ci].as_mut() {
             Node::Leaf(left) => {
@@ -182,30 +164,6 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
         }
     }
 
-    fn insert(&mut self, key: K, value: V) {
-        let max_keys = 2 * self.t - 1;
-
-        if self.root.key_count() == max_keys {
-            let old_root =
-                std::mem::replace(&mut self.root, Box::new(Node::Internal(Internal::new())));
-
-            let Node::Internal(new_root) = self.root.as_mut() else {
-                unreachable!()
-            };
-
-            new_root.children.push(old_root);
-
-            let split = Self::split_child(new_root, 0, self.t);
-            new_root.keys.push(split.promoted_key);
-            new_root.children.push(split.right_child);
-        }
-
-        let inserted = Self::insert_non_full(&mut self.root, key, value, self.t, max_keys);
-        if inserted {
-            self.len += 1
-        }
-    }
-
     fn search_node<'a>(node: &'a Node<K, V>, key: &K) -> Option<&'a V> {
         match node {
             Node::Leaf(leaf) => match leaf.entries.binary_search_by(|e| e.key.cmp(key)) {
@@ -218,10 +176,6 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
                 Self::search_node(&internal.children[child_idx], &key)
             }
         }
-    }
-
-    fn search(&self, key: &K) -> Option<&'_ V> {
-        Self::search_node(&self.root, &key)
     }
 
     fn remove_from(node: &mut Box<Node<K, V>>, key: &K, t: usize, is_root: bool) -> Option<V> {
@@ -337,7 +291,73 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
         }
     }
 
-    fn remove(&mut self, key: &K) -> Option<V> {
+    fn leftmost_leaf(node: &Node<K, V>) -> *const Leaf<K, V> {
+        match node {
+            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
+            Node::Internal(internal) => Self::leftmost_leaf(&internal.children[0]),
+        }
+    }
+
+    fn find_leaf(node: &Node<K, V>, key: &K) -> *const Leaf<K, V> {
+        match node {
+            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
+            Node::Internal(internal) => {
+                let ci = internal.child_index(key);
+                Self::find_leaf(&internal.children[ci], key)
+            }
+        }
+    }
+}
+
+impl<K: Ord + Clone, V> BPlusTree<K, V> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+impl<K: Ord + Clone, V> BPlusTree<K, V> {
+    fn new(t: usize) -> Self {
+        assert!(t >= 2, "Minimum degree must be >= 2");
+
+        Self {
+            t,
+            root: Box::new(Node::Leaf(Leaf::new())),
+            len: 0,
+        }
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        let max_keys = 2 * self.t - 1;
+
+        if self.root.key_count() == max_keys {
+            let old_root =
+                std::mem::replace(&mut self.root, Box::new(Node::Internal(Internal::new())));
+
+            let Node::Internal(new_root) = self.root.as_mut() else {
+                unreachable!()
+            };
+
+            new_root.children.push(old_root);
+
+            let split = Self::split_child(new_root, 0, self.t);
+            new_root.keys.push(split.promoted_key);
+            new_root.children.push(split.right_child);
+        }
+
+        let inserted = Self::insert_non_full(&mut self.root, key, value, self.t, max_keys);
+        if inserted {
+            self.len += 1
+        }
+    }
+
+    pub fn search(&self, key: &K) -> Option<&'_ V> {
+        Self::search_node(&self.root, &key)
+    }
+
+    pub fn remove(&mut self, key: &K) -> Option<V> {
         let value = Self::remove_from(&mut self.root, key, self.t, true);
 
         if let Node::Internal(ref internal) = *self.root {
@@ -356,23 +376,6 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
         }
 
         value
-    }
-
-    fn leftmost_leaf(node: &Node<K, V>) -> *const Leaf<K, V> {
-        match node {
-            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
-            Node::Internal(internal) => Self::leftmost_leaf(&internal.children[0]),
-        }
-    }
-
-    fn find_leaf(node: &Node<K, V>, key: &K) -> *const Leaf<K, V> {
-        match node {
-            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
-            Node::Internal(internal) => {
-                let ci = internal.child_index(key);
-                Self::find_leaf(&internal.children[ci], key)
-            }
-        }
     }
 
     pub fn iter(&self) -> LeafIter<'_, K, V> {
