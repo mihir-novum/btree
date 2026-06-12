@@ -1,17 +1,17 @@
 use std::fmt;
 use std::ops::Bound;
 
-struct LeafEntry<K: Ord + Clone, V> {
+struct LeafEntry<K: Ord + Clone, V: Clone> {
     key: K,
     value: V,
 }
 
-struct Leaf<K: Ord + Clone, V> {
+struct Leaf<K: Ord + Clone, V: Clone> {
     entries: Vec<LeafEntry<K, V>>,
     next: *mut Leaf<K, V>,
 }
 
-impl<K: Ord + Clone, V> Leaf<K, V> {
+impl<K: Ord + Clone, V: Clone> Leaf<K, V> {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -24,12 +24,12 @@ impl<K: Ord + Clone, V> Leaf<K, V> {
     }
 }
 
-struct Internal<K: Ord + Clone, V> {
+struct Internal<K: Ord + Clone, V: Clone> {
     keys: Vec<K>,
     children: Vec<Box<Node<K, V>>>,
 }
 
-impl<K: Ord + Clone, V> Internal<K, V> {
+impl<K: Ord + Clone, V: Clone> Internal<K, V> {
     fn new() -> Self {
         Self {
             keys: Vec::new(),
@@ -45,12 +45,12 @@ impl<K: Ord + Clone, V> Internal<K, V> {
     }
 }
 
-enum Node<K: Ord + Clone, V> {
+enum Node<K: Ord + Clone, V: Clone> {
     Leaf(Leaf<K, V>),
     Internal(Internal<K, V>),
 }
 
-impl<K: Ord + Clone, V> Node<K, V> {
+impl<K: Ord + Clone, V: Clone> Node<K, V> {
     fn first_key(&self) -> Option<&K> {
         match self {
             Node::Leaf(leaf) => leaf.entries.first().map(|e| &e.key),
@@ -74,18 +74,18 @@ impl<K: Ord + Clone, V> Node<K, V> {
     }
 }
 
-struct SplitResult<K: Ord + Clone, V> {
+struct SplitResult<K: Ord + Clone, V: Clone> {
     promoted_key: K,
     right_child: Box<Node<K, V>>,
 }
 
-struct BPlusTree<K: Ord + Clone, V> {
+struct BPlusTree<K: Ord + Clone, V: Clone> {
     t: usize,
     root: Box<Node<K, V>>,
     len: usize,
 }
 
-impl<K: Ord + Clone, V> BPlusTree<K, V> {
+impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
     fn redistribute_right(parent: &mut Internal<K, V>, ci: usize) {
         let (left_slice, right_slice) = parent.children.split_at_mut(ci + 1);
         let left = left_slice[ci].as_mut();
@@ -387,7 +387,7 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V> BPlusTree<K, V> {
+impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
     pub fn len(&self) -> usize {
         self.len
     }
@@ -396,7 +396,7 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
         self.len == 0
     }
 }
-impl<K: Ord + Clone, V> BPlusTree<K, V> {
+impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
     fn new(t: usize) -> Self {
         assert!(t >= 2, "Minimum degree must be >= 2");
 
@@ -470,7 +470,7 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
     }
 }
 
-impl<K: Ord + Clone + fmt::Debug, V: fmt::Debug> BPlusTree<K, V> {
+impl<K: Ord + Clone + fmt::Debug, V: fmt::Debug + Clone> BPlusTree<K, V> {
     pub fn print_tree(&self) {
         println!("BPlusTree {{ t={}, len={} }}", self.t, self.len);
         Self::print_node(&self.root, 0);
@@ -493,14 +493,14 @@ impl<K: Ord + Clone + fmt::Debug, V: fmt::Debug> BPlusTree<K, V> {
     }
 }
 
-pub struct LeafIter<'a, K: Ord + Clone, V> {
+pub struct LeafIter<'a, K: Ord + Clone, V: Clone> {
     current: *const Leaf<K, V>,
     pos: usize,
     end: Bound<K>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, K: Ord + Clone, V> LeafIter<'a, K, V> {
+impl<'a, K: Ord + Clone, V: Clone> LeafIter<'a, K, V> {
     fn new(current: *const Leaf<K, V>, pos: usize, end: Bound<K>) -> Self {
         LeafIter {
             current,
@@ -511,7 +511,7 @@ impl<'a, K: Ord + Clone, V> LeafIter<'a, K, V> {
     }
 }
 
-impl<'a, K: 'a + Ord + Clone, V: 'a> Iterator for LeafIter<'a, K, V> {
+impl<'a, K: 'a + Ord + Clone, V: 'a + Clone> Iterator for LeafIter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
