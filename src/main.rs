@@ -86,6 +86,76 @@ struct BPlusTree<K: Ord + Clone, V> {
 }
 
 impl<K: Ord + Clone, V> BPlusTree<K, V> {
+    fn redistribute_right(parent: &mut Internal<K, V>, ci: usize) {
+        let (left_slice, right_slice) = parent.children.split_at_mut(ci + 1);
+        let left = left_slice[ci].as_mut();
+        let right = right_slice[0].as_mut();
+
+        match (left, right) {
+            (Node::Leaf(left), Node::Leaf(right)) => {
+                let total = left.entries.len() + right.entries.len();
+                let target = total / 2;
+
+                let mut drained = left
+                    .entries
+                    .drain(target..)
+                    .collect::<Vec<LeafEntry<K, V>>>();
+
+                drained.append(&mut right.entries);
+                right.entries = drained;
+
+                parent.keys[ci] = right.entries[0].key.clone();
+            }
+            (Node::Internal(left), Node::Internal(right)) => {
+                let total = left.keys.len() + right.keys.len();
+                let target = total / 2;
+                let keys_to_move = left.keys.len() - target;
+
+                for _ in 0..keys_to_move {
+                    right.keys.insert(0, parent.keys[ci].clone());
+                    parent.keys[ci] = left.keys.pop().unwrap();
+                    right.children.insert(0, left.children.pop().unwrap());
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn redistribute_left(parent: &mut Internal<K, V>, ci: usize) {
+        let (left_slice, right_slice) = parent.children.split_at_mut(ci);
+        let left = left_slice[ci - 1].as_mut();
+        let right = right_slice[0].as_mut();
+
+        match (left, right) {
+            (Node::Leaf(left), Node::Leaf(right)) => {
+                let total = left.entries.len() + right.entries.len();
+                let target = total / 2;
+                let keys_to_move = right.entries.len() - target;
+
+                let drained = right
+                    .entries
+                    .drain(0..keys_to_move)
+                    .collect::<Vec<LeafEntry<K, V>>>();
+
+                left.entries.extend(drained);
+
+                parent.keys[ci - 1] = right.entries[0].key.clone();
+            }
+            (Node::Internal(left), Node::Internal(right)) => {
+                let total = left.keys.len() + right.keys.len();
+                let target = total / 2;
+                let keys_to_move = right.keys.len() - target;
+
+                for _ in 0..keys_to_move {
+                    left.keys.push(parent.keys[ci - 1].clone());
+                    parent.keys[ci - 1] = right.keys.remove(0);
+                    left.children.push(right.children.remove(0));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn split_child(parent: &mut Internal<K, V>, ci: usize, t: usize) -> SplitResult<K, V> {
         match parent.children[ci].as_mut() {
             Node::Leaf(left) => {
@@ -153,9 +223,17 @@ impl<K: Ord + Clone, V> BPlusTree<K, V> {
                 let ci = internal.child_index(&key);
 
                 if internal.children[ci].key_count() == max_keys {
-                    let split = Self::split_child(internal, ci, t);
-                    internal.keys.insert(ci, split.promoted_key);
-                    internal.children.insert(ci + 1, split.right_child);
+                    if ci + 1 < internal.children.len()
+                        && internal.children[ci + 1].key_count() < max_keys
+                    {
+                        Self::redistribute_right(internal, ci);
+                    } else if ci > 0 && internal.children[ci - 1].key_count() < max_keys {
+                        Self::redistribute_left(internal, ci);
+                    } else {
+                        let split = Self::split_child(internal, ci, t);
+                        internal.keys.insert(ci, split.promoted_key);
+                        internal.children.insert(ci + 1, split.right_child);
+                    }
                 }
 
                 let ci2 = internal.child_index(&key);
