@@ -79,83 +79,13 @@ struct SplitResult<K: Ord + Clone, V: Clone> {
     right_child: Box<Node<K, V>>,
 }
 
-struct BPlusTree<K: Ord + Clone, V: Clone> {
+pub struct BPlusTree<K: Ord + Clone, V: Clone> {
     t: usize,
     root: Box<Node<K, V>>,
     len: usize,
 }
 
 impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
-    fn redistribute_right(parent: &mut Internal<K, V>, ci: usize) {
-        let (left_slice, right_slice) = parent.children.split_at_mut(ci + 1);
-        let left = left_slice[ci].as_mut();
-        let right = right_slice[0].as_mut();
-
-        match (left, right) {
-            (Node::Leaf(left), Node::Leaf(right)) => {
-                let total = left.entries.len() + right.entries.len();
-                let target = total / 2;
-
-                let mut drained = left
-                    .entries
-                    .drain(target..)
-                    .collect::<Vec<LeafEntry<K, V>>>();
-
-                drained.append(&mut right.entries);
-                right.entries = drained;
-
-                parent.keys[ci] = right.entries[0].key.clone();
-            }
-            (Node::Internal(left), Node::Internal(right)) => {
-                let total = left.keys.len() + right.keys.len();
-                let target = total / 2;
-                let keys_to_move = left.keys.len() - target;
-
-                for _ in 0..keys_to_move {
-                    right.keys.insert(0, parent.keys[ci].clone());
-                    parent.keys[ci] = left.keys.pop().unwrap();
-                    right.children.insert(0, left.children.pop().unwrap());
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn redistribute_left(parent: &mut Internal<K, V>, ci: usize) {
-        let (left_slice, right_slice) = parent.children.split_at_mut(ci);
-        let left = left_slice[ci - 1].as_mut();
-        let right = right_slice[0].as_mut();
-
-        match (left, right) {
-            (Node::Leaf(left), Node::Leaf(right)) => {
-                let total = left.entries.len() + right.entries.len();
-                let target = total / 2;
-                let keys_to_move = right.entries.len() - target;
-
-                let drained = right
-                    .entries
-                    .drain(0..keys_to_move)
-                    .collect::<Vec<LeafEntry<K, V>>>();
-
-                left.entries.extend(drained);
-
-                parent.keys[ci - 1] = right.entries[0].key.clone();
-            }
-            (Node::Internal(left), Node::Internal(right)) => {
-                let total = left.keys.len() + right.keys.len();
-                let target = total / 2;
-                let keys_to_move = right.keys.len() - target;
-
-                for _ in 0..keys_to_move {
-                    left.keys.push(parent.keys[ci - 1].clone());
-                    parent.keys[ci - 1] = right.keys.remove(0);
-                    left.children.push(right.children.remove(0));
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-
     fn split_child(parent: &mut Internal<K, V>, ci: usize, t: usize) -> SplitResult<K, V> {
         match parent.children[ci].as_mut() {
             Node::Leaf(left) => {
@@ -201,6 +131,207 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         }
     }
 
+    fn balance_window(parent: &mut Internal<K, V>, ci: usize, t: usize, max_keys: usize) {
+        const SIBLINGS_PER_SIDE: usize = 1;
+
+        // Step 1: build window indices
+        let left_bound = ci.saturating_sub(SIBLINGS_PER_SIDE);
+        let right_bound = (ci + SIBLINGS_PER_SIDE).min(parent.children.len() - 1);
+        let mut window: Vec<usize> = (left_bound..=right_bound).collect();
+
+        // Step 2: check if we need a new node
+        let total_entries: usize = window
+            .iter()
+            .map(|&idx| parent.children[idx].key_count())
+            .sum();
+        let needs_split = total_entries >= window.len() * max_keys;
+
+        let is_leaf = parent.children[window[0]].as_ref().is_leaf();
+
+        if is_leaf {
+            // Step 3: pool all entries
+            let mut pooled: Vec<LeafEntry<K, V>> = Vec::new();
+            for &idx in &window {
+                if let Node::Leaf(leaf) = parent.children[idx].as_mut() {
+                    pooled.extend(leaf.entries.drain(..));
+                }
+            }
+
+            // Step 3b: if all full, insert new node into window
+            if needs_split {
+                let new_leaf = Box::new(Node::Leaf(Leaf::new()));
+                parent.children.insert(right_bound + 1, new_leaf);
+                parent
+                    .keys
+                    .insert(right_bound, pooled.last().unwrap().key.clone());
+                window.push(right_bound + 1);
+            }
+
+            // Step 4: distribute evenly back into window nodes
+            let n = window.len();
+            let chunk = pooled.len() / n;
+            let remainder = pooled.len() % n;
+            let mut start = 0;
+
+            for (i, &idx) in window.iter().enumerate() {
+                // first `remainder` nodes get one extra entry
+                let end = start + chunk + if i < remainder { 1 } else { 0 };
+                if let Node::Leaf(leaf) = parent.children[idx].as_mut() {
+                    leaf.entries
+                        .extend(pooled[start..end].iter().map(|e| LeafEntry {
+                            key: e.key.clone(),
+                            value: e.value.clone(),
+                        }));
+                }
+                start = end;
+            }
+
+            // Step 5: fix sibling pointers
+            for i in 0..window.len() - 1 {
+                let right_ptr = {
+                    if let Node::Leaf(right) = parent.children[window[i + 1]].as_mut() {
+                        right as *mut Leaf<K, V>
+                    } else {
+                        unreachable!()
+                    }
+                };
+                if let Node::Leaf(left) = parent.children[window[i]].as_mut() {
+                    left.next = right_ptr;
+                }
+            }
+
+            // Step 6: update parent separator keys
+            // separator between window[i] and window[i+1] = first key of window[i+1]
+            for i in 0..window.len() - 1 {
+                let sep_idx = window[i]; // separator key index = left child index
+                let first_key = if let Node::Leaf(leaf) = parent.children[window[i + 1]].as_ref() {
+                    leaf.entries[0].key.clone()
+                } else {
+                    unreachable!()
+                };
+                parent.keys[sep_idx] = first_key;
+            }
+        } else {
+            // Internal nodes
+
+            // Step 3: pool keys and children
+            let mut pooled_keys: Vec<K> = Vec::new();
+            let mut pooled_children: Vec<Box<Node<K, V>>> = Vec::new();
+
+            for &idx in &window {
+                if let Node::Internal(internal) = parent.children[idx].as_mut() {
+                    // pull the separator key from parent down before draining
+                    // except for the leftmost node in window
+                    pooled_keys.extend(internal.keys.drain(..));
+                    pooled_children.extend(internal.children.drain(..));
+                }
+            }
+
+            // pull separator keys between window nodes from parent down into pool
+            // these sit between window[i] and window[i+1] in parent.keys
+            // insert them at the right positions in pooled_keys
+            // separator between window[i] and window[i+1] = parent.keys[window[i]]
+            // we need to interleave them
+            // rebuild pooled_keys with separators included
+            let mut full_keys: Vec<K> = Vec::new();
+            let mut full_children: Vec<Box<Node<K, V>>> = Vec::new();
+
+            // children and keys are already drained into pooled_children/pooled_keys
+            // but we lost the separator keys between siblings
+            // rebuild: for each window node except last, after its keys insert parent separator
+            let mut key_offset = 0;
+            let mut child_offset = 0;
+
+            for (i, &idx) in window.iter().enumerate() {
+                // how many keys did this node originally have?
+                // we can't know now since we drained — need a different approach
+                // see note below
+                let _ = (i, idx, key_offset, child_offset);
+            }
+
+            // NOTE: the internal case is trickier because after draining we lose
+            // track of how many keys each node had. The fix: record sizes BEFORE draining.
+            // Let's redo with sizes recorded first.
+
+            // reset — redo internal pooling correctly
+            let mut pooled_keys: Vec<K> = Vec::new();
+            let mut pooled_children: Vec<Box<Node<K, V>>> = Vec::new();
+            let mut node_key_counts: Vec<usize> = Vec::new();
+            let mut node_child_counts: Vec<usize> = Vec::new();
+
+            for &idx in &window {
+                if let Node::Internal(internal) = parent.children[idx].as_mut() {
+                    node_key_counts.push(internal.keys.len());
+                    node_child_counts.push(internal.children.len());
+                    pooled_keys.extend(internal.keys.drain(..));
+                    pooled_children.extend(internal.children.drain(..));
+                }
+            }
+
+            // now interleave separator keys from parent between each window node's keys
+            // separator between window[i] and window[i+1] sits at parent.keys[window[i]]
+            let mut interleaved_keys: Vec<K> = Vec::new();
+            let mut key_cursor = 0;
+            for i in 0..window.len() {
+                let count = node_key_counts[i];
+                interleaved_keys.extend_from_slice(&pooled_keys[key_cursor..key_cursor + count]);
+                key_cursor += count;
+                // after each node except the last, insert the parent separator
+                if i < window.len() - 1 {
+                    interleaved_keys.push(parent.keys[window[i]].clone());
+                }
+            }
+
+            // Step 3b: needs split → add new internal node
+            if needs_split {
+                let new_internal = Box::new(Node::Internal(Internal::new()));
+                parent.children.insert(right_bound + 1, new_internal);
+                parent
+                    .keys
+                    .insert(right_bound, interleaved_keys.last().unwrap().clone());
+                window.push(right_bound + 1);
+            }
+
+            // Step 4: distribute evenly
+            // total keys in pool = interleaved_keys.len()
+            // n nodes in window, each node gets chunk keys and chunk+1 children
+            let n = window.len();
+            // keys between nodes act as separators — we have interleaved_keys.len() total
+            // each node gets some keys, separators go back up to parent
+            // total keys to distribute into nodes = interleaved_keys.len() - (n-1)
+            // the n-1 boundary keys go back to parent as separators
+            let total_keys = interleaved_keys.len();
+            let chunk = total_keys / n;
+            let remainder = total_keys % n;
+
+            let mut key_start = 0;
+            let mut child_start = 0;
+
+            for (i, &idx) in window.iter().enumerate() {
+                let keys_for_node = chunk + if i < remainder { 1 } else { 0 };
+                let key_end = key_start + keys_for_node;
+                let child_end = child_start + keys_for_node + 1;
+
+                if let Node::Internal(internal) = parent.children[idx].as_mut() {
+                    internal
+                        .keys
+                        .extend_from_slice(&interleaved_keys[key_start..key_end]);
+                    internal
+                        .children
+                        .extend(pooled_children.drain(..keys_for_node + 1));
+                }
+
+                // the key at key_end is the separator going back up to parent
+                if i < window.len() - 1 {
+                    parent.keys[window[i]] = interleaved_keys[key_end].clone();
+                    key_start = key_end + 1; // skip the separator
+                }
+
+                child_start = child_end;
+            }
+        }
+    }
+
     fn insert_non_full(
         node: &mut Box<Node<K, V>>,
         key: K,
@@ -223,17 +354,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
                 let ci = internal.child_index(&key);
 
                 if internal.children[ci].key_count() == max_keys {
-                    if ci + 1 < internal.children.len()
-                        && internal.children[ci + 1].key_count() < max_keys
-                    {
-                        Self::redistribute_right(internal, ci);
-                    } else if ci > 0 && internal.children[ci - 1].key_count() < max_keys {
-                        Self::redistribute_left(internal, ci);
-                    } else {
-                        let split = Self::split_child(internal, ci, t);
-                        internal.keys.insert(ci, split.promoted_key);
-                        internal.children.insert(ci + 1, split.right_child);
-                    }
+                    Self::balance_window(internal, ci, t, max_keys);
                 }
 
                 let ci2 = internal.child_index(&key);
@@ -285,7 +406,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
 
         if ci + 1 < parent.children.len() && parent.children[ci + 1].key_count() > min_keys {
             Self::borrow_from_right(parent, ci);
-        } else if ci > 0 && parent.children[ci - 1].key_count() >= min_keys {
+        } else if ci > 0 && parent.children[ci - 1].key_count() > min_keys {
             Self::borrow_from_left(parent, ci);
         } else if ci + 1 < parent.children.len() {
             Self::merge_children(parent, ci);
@@ -397,7 +518,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
     }
 }
 impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
-    fn new(t: usize) -> Self {
+    pub(crate) fn new(t: usize) -> Self {
         assert!(t >= 2, "Minimum degree must be >= 2");
 
         Self {
