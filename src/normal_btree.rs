@@ -143,8 +143,8 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
             .map(|&idx| parent.children[idx].key_count())
             .sum();
 
-        let needs_split = total_entries >= window.len() * max_keys;
-        let needs_merge = total_entries <= (window.len() - 1) * (t - 1);
+        let needs_split = total_entries > window.len() * (max_keys - 1);
+        let needs_merge = total_entries < window.len() * t;
         let is_leaf = parent.children[window[0]].as_ref().is_leaf();
 
         if is_leaf {
@@ -156,7 +156,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
                 };
 
             // ── Pool ─────────────────────────────────────────────────
-            let mut pooled: Vec<LeafEntry<K, V>> = Vec::new();
+            let mut pooled: Vec<LeafEntry<K, V>> = Vec::with_capacity(total_entries);
             for &idx in &window {
                 if let Node::Leaf(leaf) = parent.children[idx].as_mut() {
                     pooled.extend(leaf.entries.drain(..));
@@ -228,9 +228,10 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
             }
         } else {
             // ── Pool keys + children (record sizes first) ─────────────
-            let mut pooled_keys: Vec<K> = Vec::new();
-            let mut pooled_children: Vec<Box<Node<K, V>>> = Vec::new();
-            let mut node_key_counts: Vec<usize> = Vec::new();
+            let mut pooled_keys: Vec<K> = Vec::with_capacity(total_entries);
+            let mut pooled_children: Vec<Box<Node<K, V>>> =
+                Vec::with_capacity(total_entries + window.len());
+            let mut node_key_counts: Vec<usize> = Vec::with_capacity(window.len());
 
             for &idx in &window {
                 if let Node::Internal(n) = parent.children[idx].as_mut() {
@@ -241,7 +242,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
             }
 
             // ── Interleave parent separators into key pool ────────────
-            let mut interleaved: Vec<K> = Vec::new();
+            let mut interleaved: Vec<K> = Vec::with_capacity(total_entries + window.len() - 1);
             let mut cursor = 0;
             for i in 0..window.len() {
                 let count = node_key_counts[i];
@@ -274,8 +275,9 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
             // ── Distribute evenly ─────────────────────────────────────
             let n = window.len();
             let total = interleaved.len();
-            let chunk = total / n;
-            let rem = total % n;
+            let keys_for_children = total - (n - 1);
+            let chunk = keys_for_children / n;
+            let rem = keys_for_children % n;
             let mut key_start = 0;
             let mut child_start = 0;
 
