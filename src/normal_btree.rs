@@ -593,156 +593,6 @@ impl<S: PageStore> BPlusTree<S> {
         }
     }
 
-    fn insert_non_full(
-        store: &mut S,
-        node_id: PageId,
-        key: Key,
-        value: Vec<u8>,
-        t: usize,
-        max_keys: usize,
-    ) -> bool {
-        let mut node = Self::read_node(store, node_id).unwrap();
-
-        if node.is_leaf() {
-            let inserted = if let Node::Leaf(leaf) = &mut node {
-                match leaf.find_pos(&key) {
-                    Ok(i) => {
-                        leaf.entries[i].value = value;
-                        false
-                    }
-                    Err(i) => {
-                        leaf.entries.insert(i, LeafEntry { key, value });
-                        true
-                    }
-                }
-            } else {
-                unreachable!()
-            };
-
-            Self::write_node(store, node_id, &node).unwrap();
-            inserted
-        } else {
-            // Get initial child info immutably
-            let mut ci = if let Node::Internal(internal) = &node {
-                internal.child_index(&key)
-            } else {
-                unreachable!()
-            };
-
-            let child_count = {
-                let child_id = if let Node::Internal(internal) = &node {
-                    internal.children[ci]
-                } else {
-                    unreachable!()
-                };
-                Self::read_node(store, child_id).unwrap().key_count()
-            };
-
-            // If full, mutably borrow node to balance it
-            if child_count == max_keys {
-                if let Node::Internal(internal) = &mut node {
-                    Self::balance_window(internal, ci, t, max_keys, store);
-                    ci = internal.child_index(&key);
-                }
-                Self::write_node(store, node_id, &node).unwrap();
-            }
-
-            // Get the final child id immutably
-            let next_child_id = if let Node::Internal(internal) = &node {
-                internal.children[ci]
-            } else {
-                unreachable!()
-            };
-
-            Self::insert_non_full(store, next_child_id, key, value, t, max_keys)
-        }
-    }
-
-    fn search_node(store: &mut S, node_id: PageId, key: &Key) -> Option<Vec<u8>> {
-        let node = Self::read_node(store, node_id).unwrap();
-        match node {
-            Node::Leaf(leaf) => match leaf.entries.binary_search_by(|e| e.key.cmp(key)) {
-                Ok(i) => Some(leaf.entries[i].value.clone()),
-                Err(_) => None,
-            },
-            Node::Internal(internal) => {
-                let child_idx = internal.child_index(key);
-                Self::search_node(store, internal.children[child_idx], key)
-            }
-        }
-    }
-
-    fn remove_from(store: &mut S, node_id: PageId, key: &Key, t: usize) -> Option<Vec<u8>> {
-        let mut node = Self::read_node(store, node_id).unwrap();
-
-        if node.is_leaf() {
-            let removed = if let Node::Leaf(leaf) = &mut node {
-                match leaf.find_pos(key) {
-                    Ok(i) => Some(leaf.entries.remove(i).value),
-                    Err(_) => None,
-                }
-            } else {
-                unreachable!()
-            };
-
-            if removed.is_some() {
-                Self::write_node(store, node_id, &node).unwrap();
-            }
-            removed
-        } else {
-            let mut ci = if let Node::Internal(internal) = &node {
-                internal.child_index(key)
-            } else {
-                unreachable!()
-            };
-
-            let child_count = {
-                let child_id = if let Node::Internal(internal) = &node {
-                    internal.children[ci]
-                } else {
-                    unreachable!()
-                };
-                Self::read_node(store, child_id).unwrap().key_count()
-            };
-
-            let mut changed = false;
-
-            if child_count <= t - 1 {
-                if let Node::Internal(internal) = &mut node {
-                    Self::balance_window(internal, ci, t, 2 * t - 1, store);
-                    ci = internal.child_index(key);
-                }
-                changed = true;
-            }
-
-            let next_child_id = if let Node::Internal(internal) = &node {
-                internal.children[ci]
-            } else {
-                unreachable!()
-            };
-
-            let removed = Self::remove_from(store, next_child_id, key, t);
-
-            if removed.is_some() && ci > 0 {
-                let child_node = Self::read_node(store, next_child_id).unwrap();
-                if let Some(first) = child_node.first_key(store) {
-                    if let Node::Internal(internal) = &mut node {
-                        if internal.keys[ci - 1] != first {
-                            internal.keys[ci - 1] = first;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-
-            if changed {
-                Self::write_node(store, node_id, &node).unwrap();
-            }
-
-            removed
-        }
-    }
-
     fn leftmost_leaf(store: &mut S, node_id: PageId) -> PageId {
         let node = Self::read_node(store, node_id).unwrap();
         match node {
@@ -752,12 +602,15 @@ impl<S: PageStore> BPlusTree<S> {
     }
 
     fn find_leaf(store: &mut S, node_id: PageId, key: &Key) -> PageId {
-        let node = Self::read_node(store, node_id).unwrap();
-        match node {
-            Node::Leaf(_) => node_id,
-            Node::Internal(internal) => {
-                let ci = internal.child_index(key);
-                Self::find_leaf(store, internal.children[ci], key)
+        let mut current_id = node_id;
+        loop {
+            let node = Self::read_node(store, current_id).unwrap();
+            match node {
+                Node::Leaf(_) => return node_id,
+                Node::Internal(internal) => {
+                    let ci = internal.child_index(key);
+                    current_id = internal.children[ci];
+                }
             }
         }
     }
@@ -817,38 +670,176 @@ impl<S: PageStore> BPlusTree<S> {
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) {
+        // 1. Root split check (Remains exactly the same)
         let root_node = Self::read_node(&mut self.store, self.root).unwrap();
         let max_keys = 2 * self.t - 1;
 
         if root_node.key_count() == max_keys {
             let new_root_id = Self::allocate_internal(&mut self.store).unwrap();
             let old_root_id = std::mem::replace(&mut self.root, new_root_id);
-
             let (promoted_key, right_child_id) =
                 Self::split_root_child(&mut self.store, old_root_id, self.t);
-
             let new_root = Internal {
                 keys: vec![promoted_key],
                 children: vec![old_root_id, right_child_id],
             };
-
             Self::write_node(&mut self.store, new_root_id, &Node::Internal(new_root)).unwrap();
         }
 
-        let inserted =
-            Self::insert_non_full(&mut self.store, self.root, key, value, self.t, max_keys);
-        if inserted {
-            self.len += 1
+        // 2. Iterative Top-Down Insert
+        let mut current_id = self.root;
+
+        loop {
+            let mut node = Self::read_node(&mut self.store, current_id).unwrap();
+
+            if node.is_leaf() {
+                // Tightly scoped mutable borrow
+                let inserted = if let Node::Leaf(leaf) = &mut node {
+                    match leaf.find_pos(&key) {
+                        Ok(i) => {
+                            leaf.entries[i].value = value;
+                            false
+                        }
+                        Err(i) => {
+                            leaf.entries.insert(i, LeafEntry { key, value });
+                            true
+                        }
+                    }
+                } else {
+                    unreachable!()
+                };
+
+                // Mutable borrow is gone, safe to write!
+                Self::write_node(&mut self.store, current_id, &node).unwrap();
+                if inserted {
+                    self.len += 1;
+                }
+                break; // DONE!
+            } else {
+                // Immutable lookahead
+                let mut ci = if let Node::Internal(internal) = &node {
+                    internal.child_index(&key)
+                } else {
+                    unreachable!()
+                };
+                let mut child_id = if let Node::Internal(internal) = &node {
+                    internal.children[ci]
+                } else {
+                    unreachable!()
+                };
+
+                let child_count = Self::read_node(&mut self.store, child_id)
+                    .unwrap()
+                    .key_count();
+
+                // Proactive Split
+                if child_count == max_keys {
+                    // Tightly scoped mutable balance
+                    if let Node::Internal(internal) = &mut node {
+                        Self::balance_window(internal, ci, self.t, max_keys, &mut self.store);
+                    }
+
+                    // Safe to write!
+                    Self::write_node(&mut self.store, current_id, &node).unwrap();
+
+                    // Recompute immutably because keys shifted!
+                    if let Node::Internal(internal) = &node {
+                        ci = internal.child_index(&key);
+                        child_id = internal.children[ci];
+                    }
+                }
+
+                // Move down to the safe child
+                current_id = child_id;
+            }
         }
     }
 
     pub fn search(&mut self, key: &Key) -> Option<Vec<u8>> {
-        Self::search_node(&mut self.store, self.root, key)
+        let mut current_id = self.root;
+
+        loop {
+            let node = Self::read_node(&mut self.store, current_id).unwrap();
+
+            match node {
+                Node::Leaf(leaf) => {
+                    return match leaf.entries.binary_search_by(|e| e.key.cmp(key)) {
+                        Ok(i) => Some(leaf.entries[i].value.clone()),
+                        Err(_) => None,
+                    };
+                }
+                Node::Internal(internal) => {
+                    let ci = internal.child_index(key);
+                    current_id = internal.children[ci];
+                }
+            }
+        }
     }
 
     pub fn remove(&mut self, key: &Key) -> Option<Vec<u8>> {
-        let value = Self::remove_from(&mut self.store, self.root, key, self.t);
+        let mut current_id = self.root;
+        let mut removed_value = None;
 
+        // 1. Iterative Top-Down Remove
+        loop {
+            let mut node = Self::read_node(&mut self.store, current_id).unwrap();
+
+            if node.is_leaf() {
+                // Tightly scoped mutable borrow
+                removed_value = if let Node::Leaf(leaf) = &mut node {
+                    match leaf.find_pos(key) {
+                        Ok(i) => Some(leaf.entries.remove(i).value),
+                        Err(_) => None,
+                    }
+                } else {
+                    unreachable!()
+                };
+
+                // Mutable borrow is gone, safe to write!
+                if removed_value.is_some() {
+                    Self::write_node(&mut self.store, current_id, &node).unwrap();
+                }
+                break; // DONE!
+            } else {
+                // Immutable lookahead
+                let mut ci = if let Node::Internal(internal) = &node {
+                    internal.child_index(key)
+                } else {
+                    unreachable!()
+                };
+                let mut child_id = if let Node::Internal(internal) = &node {
+                    internal.children[ci]
+                } else {
+                    unreachable!()
+                };
+
+                let child_count = Self::read_node(&mut self.store, child_id)
+                    .unwrap()
+                    .key_count();
+
+                // Proactive Merge
+                if child_count <= self.t - 1 {
+                    // Tightly scoped mutable balance
+                    if let Node::Internal(internal) = &mut node {
+                        Self::balance_window(internal, ci, self.t, 2 * self.t - 1, &mut self.store);
+                    }
+
+                    // Safe to write!
+                    Self::write_node(&mut self.store, current_id, &node).unwrap();
+
+                    // Recompute immutably because keys shifted!
+                    if let Node::Internal(internal) = &node {
+                        ci = internal.child_index(key);
+                        child_id = internal.children[ci];
+                    }
+                }
+
+                // Move down to the safe child
+                current_id = child_id;
+            }
+        }
+
+        // 2. Root empty check (Remains exactly the same)
         let root_node = Self::read_node(&mut self.store, self.root).unwrap();
         if let Node::Internal(internal) = root_node {
             if internal.keys.is_empty() {
@@ -858,11 +849,11 @@ impl<S: PageStore> BPlusTree<S> {
             }
         }
 
-        if value.is_some() {
+        if removed_value.is_some() {
             self.len -= 1;
         }
 
-        value
+        removed_value
     }
 
     pub fn iter(&mut self) -> LeafIter<'_, S> {
