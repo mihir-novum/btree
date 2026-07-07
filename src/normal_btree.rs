@@ -675,13 +675,15 @@ impl<S: PageStore> BPlusTree<S> {
     pub fn insert(&self, key: Key, value: Vec<u8>) {
         let max_keys = 2 * self.t - 1;
 
-        let mut current_id = self.root.load(Ordering::Acquire);
-        let mut current_guard = self.store.write(current_id).unwrap();
-        while self.root.load(Ordering::Acquire) != current_id {
-            drop(current_guard);
-            current_id = self.root.load(Ordering::Acquire);
-            current_guard = self.store.write(current_id).unwrap();
-        }
+        let (mut current_id, mut current_guard) = loop {
+            let id = self.root.load(Ordering::Acquire);
+            let guard = self.store.write(id).unwrap();
+
+            if self.root.load(Ordering::Acquire) == id {
+                break (id, guard); // Safely escape the loop with our locked root!
+            }
+            // If we don't break, `guard` is dropped right here!
+        };
 
         let mut node = Node::deserialize(&*current_guard);
 
@@ -695,7 +697,10 @@ impl<S: PageStore> BPlusTree<S> {
                     let promoted_key = right_entries[0].key.clone();
 
                     let right_id = Self::allocate_leaf(&self.store).unwrap();
-                    let right_leaf = Leaf { entries: right_entries, next: left.next };
+                    let right_leaf = Leaf {
+                        entries: right_entries,
+                        next: left.next,
+                    };
                     left.next = Some(right_id);
 
                     (promoted_key, right_id, Node::Leaf(right_leaf))
@@ -709,7 +714,10 @@ impl<S: PageStore> BPlusTree<S> {
                     let right_children = left.children.split_off(mid + 1);
 
                     let right_id = Self::allocate_internal(&self.store).unwrap();
-                    let right_node = Internal { keys: right_keys, children: right_children };
+                    let right_node = Internal {
+                        keys: right_keys,
+                        children: right_children,
+                    };
 
                     (promoted_key, right_id, Node::Internal(right_node))
                 }
@@ -745,11 +753,19 @@ impl<S: PageStore> BPlusTree<S> {
                             false
                         }
                         Err(i) => {
-                            leaf.entries.insert(i, LeafEntry { key: key.clone(), value: value.clone() });
+                            leaf.entries.insert(
+                                i,
+                                LeafEntry {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                },
+                            );
                             true
                         }
                     }
-                } else { unreachable!() };
+                } else {
+                    unreachable!()
+                };
 
                 current_guard.copy_from_slice(&node.serialize());
 
@@ -757,10 +773,17 @@ impl<S: PageStore> BPlusTree<S> {
                     self.len.fetch_add(1, Ordering::Relaxed);
                 }
                 break;
-
             } else {
-                let mut ci = if let Node::Internal(internal) = &node { internal.child_index(&key) } else { unreachable!() };
-                let mut child_id = if let Node::Internal(internal) = &node { internal.children[ci] } else { unreachable!() };
+                let mut ci = if let Node::Internal(internal) = &node {
+                    internal.child_index(&key)
+                } else {
+                    unreachable!()
+                };
+                let mut child_id = if let Node::Internal(internal) = &node {
+                    internal.children[ci]
+                } else {
+                    unreachable!()
+                };
 
                 // Peek at the child safely
                 let child_is_full = {
@@ -788,13 +811,15 @@ impl<S: PageStore> BPlusTree<S> {
     }
 
     pub fn search(&self, key: &Key) -> Option<Vec<u8>> {
-        let mut current_id = self.root.load(Ordering::Acquire);
-        let mut current_guard = self.store.read(current_id).unwrap();
-        while self.root.load(Ordering::Acquire) != current_id {
-            drop(current_guard);
-            current_id = self.root.load(Ordering::Acquire);
-            current_guard = self.store.read(current_id).unwrap();
-        }
+        let (_, mut current_guard) = loop {
+            let id = self.root.load(Ordering::Acquire);
+            let guard = self.store.read(id).unwrap();
+
+            if self.root.load(Ordering::Acquire) == id {
+                break (id, guard); // Safely escape the loop with our locked root!
+            }
+            // If we don't break, `guard` is dropped right here!
+        };
 
         loop {
             // Re-deserialize at the top of EVERY loop!
@@ -821,13 +846,15 @@ impl<S: PageStore> BPlusTree<S> {
     }
 
     pub fn remove(&self, key: &Key) -> Option<Vec<u8>> {
-        let mut current_id = self.root.load(Ordering::Acquire);
-        let mut current_guard = self.store.write(current_id).unwrap();
-        while self.root.load(Ordering::Acquire) != current_id {
-            drop(current_guard);
-            current_id = self.root.load(Ordering::Acquire);
-            current_guard = self.store.write(current_id).unwrap();
-        }
+        let (mut current_id, mut current_guard) = loop {
+            let id = self.root.load(Ordering::Acquire);
+            let guard = self.store.write(id).unwrap();
+
+            if self.root.load(Ordering::Acquire) == id {
+                break (id, guard); // Safely escape the loop with our locked root!
+            }
+            // If we don't break, `guard` is dropped right here!
+        };
 
         let mut removed_value = None;
 
@@ -842,15 +869,25 @@ impl<S: PageStore> BPlusTree<S> {
                         Ok(i) => Some(leaf.entries.remove(i).value),
                         Err(_) => None,
                     }
-                } else { unreachable!() };
+                } else {
+                    unreachable!()
+                };
 
                 if removed_value.is_some() {
                     current_guard.copy_from_slice(&node.serialize());
                 }
                 break;
             } else {
-                let mut ci = if let Node::Internal(internal) = &node { internal.child_index(key) } else { unreachable!() };
-                let mut child_id = if let Node::Internal(internal) = &node { internal.children[ci] } else { unreachable!() };
+                let mut ci = if let Node::Internal(internal) = &node {
+                    internal.child_index(key)
+                } else {
+                    unreachable!()
+                };
+                let mut child_id = if let Node::Internal(internal) = &node {
+                    internal.children[ci]
+                } else {
+                    unreachable!()
+                };
 
                 let child_is_starving = {
                     let child_guard = self.store.read(child_id).unwrap();
