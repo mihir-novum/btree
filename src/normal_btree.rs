@@ -1,17 +1,131 @@
+use crate::store::PageId;
 use std::collections::Bound;
-use std::fmt;
 
-struct LeafEntry<K: Ord + Clone, V: Clone> {
-    key: K,
-    value: V,
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct Key(pub Vec<u8>);
+
+// Bytes
+impl From<Vec<u8>> for Key {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
 }
 
-struct Leaf<K: Ord + Clone, V: Clone> {
-    entries: Vec<LeafEntry<K, V>>,
-    next: *mut Leaf<K, V>,
+impl From<&[u8]> for Key {
+    fn from(v: &[u8]) -> Self {
+        Self(v.to_vec())
+    }
 }
 
-impl<K: Ord + Clone, V: Clone> Leaf<K, V> {
+impl<const N: usize> From<[u8; N]> for Key {
+    fn from(v: [u8; N]) -> Self {
+        Self(v.to_vec())
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for Key {
+    fn from(v: &[u8; N]) -> Self {
+        Self(v.to_vec())
+    }
+}
+
+// Strings
+impl From<String> for Key {
+    fn from(s: String) -> Self {
+        Self(s.into_bytes())
+    }
+}
+
+impl From<&str> for Key {
+    fn from(s: &str) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+}
+
+// Integers
+macro_rules! impl_from_int {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl From<$t> for Key {
+                fn from(v: $t) -> Self {
+                    Self(v.to_be_bytes().to_vec())
+                }
+            }
+        )*
+    };
+}
+
+impl_from_int!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
+);
+
+// Floats
+macro_rules! impl_from_float {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl From<$t> for Key {
+                fn from(v: $t) -> Self {
+                    Self(v.to_be_bytes().to_vec())
+                }
+            }
+        )*
+    };
+}
+
+impl_from_float!(f32, f64);
+
+// bool
+impl From<bool> for Key {
+    fn from(v: bool) -> Self {
+        Self(vec![v as u8])
+    }
+}
+
+// char (UTF-8)
+impl From<char> for Key {
+    fn from(c: char) -> Self {
+        let mut buf = [0; 4];
+        Self(c.encode_utf8(&mut buf).as_bytes().to_vec())
+    }
+}
+
+impl Key {
+    pub fn from_u64(v: u64) -> Self {
+        Key(v.to_be_bytes().to_vec())
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        Key(s.as_bytes().to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct LeafEntry {
+    key: Key,
+    value: Vec<u8>,
+}
+
+struct Leaf {
+    entries: Vec<LeafEntry>,
+    next: *mut Leaf,
+}
+
+impl Leaf {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -19,17 +133,17 @@ impl<K: Ord + Clone, V: Clone> Leaf<K, V> {
         }
     }
 
-    fn find_pos(&self, key: &K) -> Result<usize, usize> {
+    fn find_pos(&self, key: &Key) -> Result<usize, usize> {
         self.entries.binary_search_by(|e| e.key.cmp(key))
     }
 }
 
-struct Internal<K: Ord + Clone, V: Clone> {
-    keys: Vec<K>,
-    children: Vec<Box<Node<K, V>>>,
+struct Internal {
+    keys: Vec<Key>,
+    children: Vec<Box<Node>>,
 }
 
-impl<K: Ord + Clone, V: Clone> Internal<K, V> {
+impl Internal {
     fn new() -> Self {
         Self {
             keys: Vec::new(),
@@ -37,7 +151,7 @@ impl<K: Ord + Clone, V: Clone> Internal<K, V> {
         }
     }
 
-    fn child_index(&self, key: &K) -> usize {
+    fn child_index(&self, key: &Key) -> usize {
         match self.keys.binary_search(key) {
             Ok(i) => i + 1,
             Err(i) => i,
@@ -45,13 +159,13 @@ impl<K: Ord + Clone, V: Clone> Internal<K, V> {
     }
 }
 
-enum Node<K: Ord + Clone, V: Clone> {
-    Leaf(Leaf<K, V>),
-    Internal(Internal<K, V>),
+enum Node {
+    Leaf(Leaf),
+    Internal(Internal),
 }
 
-impl<K: Ord + Clone, V: Clone> Node<K, V> {
-    fn first_key(&self) -> Option<&K> {
+impl Node {
+    fn first_key(&self) -> Option<&Key> {
         match self {
             Node::Leaf(leaf) => leaf.entries.first().map(|e| &e.key),
             Node::Internal(internal) => internal.children.first().and_then(|c| c.first_key()),
@@ -74,19 +188,19 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
     }
 }
 
-struct SplitResult<K: Ord + Clone, V: Clone> {
-    promoted_key: K,
-    right_child: Box<Node<K, V>>,
+struct SplitResult {
+    promoted_key: Key,
+    right_child: Box<Node>,
 }
 
-pub struct BPlusTree<K: Ord + Clone, V: Clone> {
+pub struct BPlusTree {
     t: usize,
-    root: Box<Node<K, V>>,
+    root: Box<Node>,
     len: usize,
 }
 
-impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
-    fn split_child(parent: &mut Internal<K, V>, ci: usize, t: usize) -> SplitResult<K, V> {
+impl BPlusTree {
+    fn split_child(parent: &mut Internal, ci: usize, t: usize) -> SplitResult {
         match parent.children[ci].as_mut() {
             Node::Leaf(left) => {
                 let right_entries = left.entries.split_off(t);
@@ -99,7 +213,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
                 let mut right_box = Box::new(Node::Leaf(right_leaf));
 
                 let right_ptr = match right_box.as_mut() {
-                    Node::Leaf(rl) => rl as *mut Leaf<K, V>,
+                    Node::Leaf(rl) => rl as *mut Leaf,
                     _ => unreachable!(),
                 };
 
@@ -131,7 +245,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         }
     }
 
-    fn balance_window(parent: &mut Internal<K, V>, ci: usize, t: usize, max_keys: usize) {
+    fn balance_window(parent: &mut Internal, ci: usize, t: usize, max_keys: usize) {
         const SIBLINGS_PER_SIDE: usize = 1;
 
         let left_bound = ci.saturating_sub(SIBLINGS_PER_SIDE);
@@ -156,7 +270,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
                 };
 
             // ── Pool ─────────────────────────────────────────────────
-            let mut pooled: Vec<LeafEntry<K, V>> = Vec::with_capacity(total_entries);
+            let mut pooled: Vec<LeafEntry> = Vec::with_capacity(total_entries);
             for &idx in &window {
                 if let Node::Leaf(leaf) = parent.children[idx].as_mut() {
                     pooled.extend(leaf.entries.drain(..));
@@ -202,7 +316,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
             for i in 0..window.len() - 1 {
                 let right_ptr = {
                     if let Node::Leaf(r) = parent.children[window[i + 1]].as_mut() {
-                        r as *mut Leaf<K, V>
+                        r as *mut Leaf
                     } else {
                         unreachable!()
                     }
@@ -228,8 +342,8 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
             }
         } else {
             // ── Pool keys + children (record sizes first) ─────────────
-            let mut pooled_keys: Vec<K> = Vec::with_capacity(total_entries);
-            let mut pooled_children: Vec<Box<Node<K, V>>> =
+            let mut pooled_keys: Vec<Key> = Vec::with_capacity(total_entries);
+            let mut pooled_children: Vec<Box<Node>> =
                 Vec::with_capacity(total_entries + window.len());
             let mut node_key_counts: Vec<usize> = Vec::with_capacity(window.len());
 
@@ -242,7 +356,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
             }
 
             // ── Interleave parent separators into key pool ────────────
-            let mut interleaved: Vec<K> = Vec::with_capacity(total_entries + window.len() - 1);
+            let mut interleaved: Vec<Key> = Vec::with_capacity(total_entries + window.len() - 1);
             let mut cursor = 0;
             for i in 0..window.len() {
                 let count = node_key_counts[i];
@@ -307,9 +421,9 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
     }
 
     fn insert_non_full(
-        node: &mut Box<Node<K, V>>,
-        key: K,
-        value: V,
+        node: &mut Box<Node>,
+        key: Key,
+        value: Vec<u8>,
         t: usize,
         max_keys: usize,
     ) -> bool {
@@ -337,7 +451,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         }
     }
 
-    fn search_node<'a>(node: &'a Node<K, V>, key: &K) -> Option<&'a V> {
+    fn search_node<'a>(node: &'a Node, key: &Key) -> Option<&'a [u8]> {
         match node {
             Node::Leaf(leaf) => match leaf.entries.binary_search_by(|e| e.key.cmp(key)) {
                 Ok(i) => Some(&leaf.entries[i].value),
@@ -351,7 +465,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         }
     }
 
-    fn remove_from(node: &mut Box<Node<K, V>>, key: &K, t: usize) -> Option<V> {
+    fn remove_from(node: &mut Box<Node>, key: &Key, t: usize) -> Option<Vec<u8>> {
         match node.as_mut() {
             Node::Leaf(leaf) => match leaf.find_pos(key) {
                 Ok(i) => Some(leaf.entries.remove(i).value),
@@ -383,16 +497,16 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         }
     }
 
-    fn leftmost_leaf(node: &Node<K, V>) -> *const Leaf<K, V> {
+    fn leftmost_leaf(node: &Node) -> *const Leaf {
         match node {
-            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
+            Node::Leaf(leaf) => leaf as *const Leaf,
             Node::Internal(internal) => Self::leftmost_leaf(&internal.children[0]),
         }
     }
 
-    fn find_leaf(node: &Node<K, V>, key: &K) -> *const Leaf<K, V> {
+    fn find_leaf(node: &Node, key: &Key) -> *const Leaf {
         match node {
-            Node::Leaf(leaf) => leaf as *const Leaf<K, V>,
+            Node::Leaf(leaf) => leaf as *const Leaf,
             Node::Internal(internal) => {
                 let ci = internal.child_index(key);
                 Self::find_leaf(&internal.children[ci], key)
@@ -401,7 +515,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
+impl BPlusTree {
     pub fn len(&self) -> usize {
         self.len
     }
@@ -410,7 +524,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         self.len == 0
     }
 }
-impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
+impl BPlusTree {
     pub(crate) fn new(t: usize) -> Self {
         assert!(t >= 2, "Minimum degree must be >= 2");
 
@@ -421,7 +535,7 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         }
     }
 
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&mut self, key: Key, value: Vec<u8>) {
         let max_keys = 2 * self.t - 1;
 
         if self.root.key_count() == max_keys {
@@ -445,11 +559,11 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         }
     }
 
-    pub fn search(&self, key: &K) -> Option<&'_ V> {
+    pub fn search(&self, key: &Key) -> Option<&'_ [u8]> {
         Self::search_node(&self.root, &key)
     }
 
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    pub fn remove(&mut self, key: &Key) -> Option<Vec<u8>> {
         let value = Self::remove_from(&mut self.root, key, self.t);
 
         if let Node::Internal(ref internal) = *self.root {
@@ -470,12 +584,12 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
         value
     }
 
-    pub fn iter(&self) -> LeafIter<'_, K, V> {
+    pub fn iter(&self) -> LeafIter<'_> {
         let leaf = Self::leftmost_leaf(&self.root);
         LeafIter::new(leaf, 0, Bound::Unbounded)
     }
 
-    pub fn range_from(&self, start: &K, end: Bound<K>) -> LeafIter<'_, K, V> {
+    pub fn range_from(&self, start: &Key, end: Bound<Key>) -> LeafIter<'_> {
         let leaf = Self::find_leaf(&self.root, start);
 
         let pos = unsafe { (*leaf).entries.partition_point(|e| &e.key < start) };
@@ -484,13 +598,13 @@ impl<K: Ord + Clone, V: Clone> BPlusTree<K, V> {
     }
 }
 
-impl<K: Ord + Clone + fmt::Debug, V: fmt::Debug + Clone> BPlusTree<K, V> {
+impl BPlusTree {
     pub fn print_tree(&self) {
         println!("BPlusTree {{ t={}, len={} }}", self.t, self.len);
         Self::print_node(&self.root, 0);
     }
 
-    fn print_node(node: &Node<K, V>, depth: usize) {
+    fn print_node(node: &Node, depth: usize) {
         let indent = "  ".repeat(depth);
         match node {
             Node::Leaf(l) => {
@@ -507,15 +621,15 @@ impl<K: Ord + Clone + fmt::Debug, V: fmt::Debug + Clone> BPlusTree<K, V> {
     }
 }
 
-pub struct LeafIter<'a, K: Ord + Clone, V: Clone> {
-    current: *const Leaf<K, V>,
+pub struct LeafIter<'a> {
+    current: *const Leaf,
     pos: usize,
-    end: Bound<K>,
+    end: Bound<Key>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, K: Ord + Clone, V: Clone> LeafIter<'a, K, V> {
-    fn new(current: *const Leaf<K, V>, pos: usize, end: Bound<K>) -> Self {
+impl<'a> LeafIter<'a> {
+    fn new(current: *const Leaf, pos: usize, end: Bound<Key>) -> Self {
         LeafIter {
             current,
             pos,
@@ -525,8 +639,8 @@ impl<'a, K: Ord + Clone, V: Clone> LeafIter<'a, K, V> {
     }
 }
 
-impl<'a, K: 'a + Ord + Clone, V: 'a + Clone> Iterator for LeafIter<'a, K, V> {
-    type Item = (&'a K, &'a V);
+impl<'a> Iterator for LeafIter<'a> {
+    type Item = (&'a Key, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
