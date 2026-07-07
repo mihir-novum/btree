@@ -1,5 +1,6 @@
 use crate::store::{NULL_PAGE, PAGE_SIZE, PageId, PageStore, PageType};
 use std::collections::Bound;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct Key(pub Vec<u8>);
@@ -293,7 +294,7 @@ enum Node {
 }
 
 impl Node {
-    fn first_key<S: PageStore>(&self, store: &mut S) -> Option<Key> {
+    fn first_key<S: PageStore>(&self, store: &S) -> Option<Key> {
         match self {
             Node::Leaf(leaf) => leaf.entries.first().map(|e| e.key.clone()),
             Node::Internal(internal) => {
@@ -374,13 +375,13 @@ impl From<Internal> for Node {
 #[derive(Debug)]
 pub struct BPlusTree<S: PageStore> {
     t: usize,
-    root: PageId,
-    len: usize,
+    root: AtomicU64,
+    len: AtomicUsize,
     store: S,
 }
 
 impl<S: PageStore> BPlusTree<S> {
-    fn split_root_child(store: &mut S, old_root_id: PageId, t: usize) -> (Key, PageId) {
+    fn split_root_child(store: &S, old_root_id: PageId, t: usize) -> (Key, PageId) {
         let mut old_root = Self::read_node(store, old_root_id).unwrap();
 
         // 1. Mutate old_root and build the new right_node, returning what we need.
@@ -424,7 +425,7 @@ impl<S: PageStore> BPlusTree<S> {
         (promoted_key, right_id)
     }
 
-    fn balance_window(parent: &mut Internal, ci: usize, t: usize, max_keys: usize, store: &mut S) {
+    fn balance_window(parent: &mut Internal, ci: usize, t: usize, max_keys: usize, store: &S) {
         const SIBLINGS_PER_SIDE: usize = 1;
 
         let left_bound = ci.saturating_sub(SIBLINGS_PER_SIDE);
@@ -593,7 +594,7 @@ impl<S: PageStore> BPlusTree<S> {
         }
     }
 
-    fn leftmost_leaf(store: &mut S, node_id: PageId) -> PageId {
+    fn leftmost_leaf(store: &S, node_id: PageId) -> PageId {
         let node = Self::read_node(store, node_id).unwrap();
         match node {
             Node::Leaf(_) => node_id,
@@ -601,7 +602,7 @@ impl<S: PageStore> BPlusTree<S> {
         }
     }
 
-    fn find_leaf(store: &mut S, node_id: PageId, key: &Key) -> PageId {
+    fn find_leaf(store: &S, node_id: PageId, key: &Key) -> PageId {
         let mut current_id = node_id;
         loop {
             let node = Self::read_node(store, current_id).unwrap();
@@ -617,271 +618,319 @@ impl<S: PageStore> BPlusTree<S> {
 }
 
 impl<S: PageStore> BPlusTree<S> {
-    pub fn allocate_leaf(store: &mut S) -> Result<PageId, S::Error> {
-        let id = store.allocate()?;
+    // 1. Read a Node (Grabs a Read Latch, reads bytes, and DROPS the Latch instantly)
+    // We only hold the read latch just long enough to copy the bytes into our memory `Node`.
+    fn read_node(store: &S, id: PageId) -> Result<Node, S::Error> {
+        let guard = store.read(id)?;
+        Ok(Node::deserialize(&guard))
+    }
+
+    // 2. Write a Node (Grabs a Write Latch, overwrites bytes, and DROPS the Latch instantly)
+    fn write_node(store: &S, id: PageId, node: &Node) -> Result<(), S::Error> {
+        let mut guard = store.write(id)?;
+        let page_bytes = node.serialize();
+        guard.copy_from_slice(&page_bytes);
+        Ok(())
+    }
+
+    pub fn allocate_leaf(store: &S) -> Result<PageId, S::Error> {
+        let (id, mut guard) = store.allocate()?;
         let page = Leaf::new().serialize();
-        store.write(id, &page)?;
+        guard.copy_from_slice(&page);
         Ok(id)
     }
 
-    pub fn allocate_internal(store: &mut S) -> Result<PageId, S::Error> {
-        let id = store.allocate()?;
+    pub fn allocate_internal(store: &S) -> Result<PageId, S::Error> {
+        let (id, mut guard) = store.allocate()?;
         let page = Internal::new().serialize();
-        store.write(id, &page)?;
+        guard.copy_from_slice(&page);
         Ok(id)
-    }
-
-    fn read_node(store: &mut S, id: PageId) -> Result<Node, S::Error> {
-        let page = store.read(id)?;
-        Ok(Node::deserialize(&page))
-    }
-
-    fn write_node(store: &mut S, id: PageId, node: &Node) -> Result<(), S::Error> {
-        let page = node.serialize();
-        store.write(id, &page)
     }
 }
 
 impl<S: PageStore> BPlusTree<S> {
     pub fn len(&self) -> usize {
-        self.len
+        self.len.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 }
 
 impl<S: PageStore> BPlusTree<S> {
-    pub fn new(t: usize, mut store: S) -> Result<Self, S::Error> {
+    pub fn new(t: usize, store: S) -> Result<Self, S::Error> {
         assert!(t >= 2, "Minimum degree must be >= 2");
 
-        let root = store.allocate()?;
-        let leaf = Leaf::new();
-        let page = leaf.serialize();
-        store.write(root, &page)?;
+        let root = Self::allocate_leaf(&store)?;
 
         Ok(Self {
             t,
-            root,
-            len: 0,
+            root: AtomicU64::new(root),
+            len: AtomicUsize::new(0),
             store,
         })
     }
 
-    pub fn insert(&mut self, key: Key, value: Vec<u8>) {
-        // 1. Root split check (Remains exactly the same)
-        let root_node = Self::read_node(&mut self.store, self.root).unwrap();
+    pub fn insert(&self, key: Key, value: Vec<u8>) {
         let max_keys = 2 * self.t - 1;
 
-        if root_node.key_count() == max_keys {
-            let new_root_id = Self::allocate_internal(&mut self.store).unwrap();
-            let old_root_id = std::mem::replace(&mut self.root, new_root_id);
-            let (promoted_key, right_child_id) =
-                Self::split_root_child(&mut self.store, old_root_id, self.t);
-            let new_root = Internal {
-                keys: vec![promoted_key],
-                children: vec![old_root_id, right_child_id],
-            };
-            Self::write_node(&mut self.store, new_root_id, &Node::Internal(new_root)).unwrap();
+        let mut current_id = self.root.load(Ordering::Acquire);
+        let mut current_guard = self.store.write(current_id).unwrap();
+        while self.root.load(Ordering::Acquire) != current_id {
+            drop(current_guard);
+            current_id = self.root.load(Ordering::Acquire);
+            current_guard = self.store.write(current_id).unwrap();
         }
 
-        // 2. Iterative Top-Down Insert
-        let mut current_id = self.root;
+        let mut node = Node::deserialize(&*current_guard);
 
+        // 2. Safely split the root
+        if node.key_count() == max_keys {
+            let new_root_id = Self::allocate_internal(&self.store).unwrap();
+
+            let (promoted_key, right_child_id, right_node) = match &mut node {
+                Node::Leaf(left) => {
+                    let right_entries = left.entries.split_off(self.t);
+                    let promoted_key = right_entries[0].key.clone();
+
+                    let right_id = Self::allocate_leaf(&self.store).unwrap();
+                    let right_leaf = Leaf { entries: right_entries, next: left.next };
+                    left.next = Some(right_id);
+
+                    (promoted_key, right_id, Node::Leaf(right_leaf))
+                }
+                Node::Internal(left) => {
+                    let mid = self.t - 1;
+                    let promoted_key = left.keys[mid].clone();
+
+                    let mut right_keys = left.keys.split_off(mid);
+                    right_keys.remove(0);
+                    let right_children = left.children.split_off(mid + 1);
+
+                    let right_id = Self::allocate_internal(&self.store).unwrap();
+                    let right_node = Internal { keys: right_keys, children: right_children };
+
+                    (promoted_key, right_id, Node::Internal(right_node))
+                }
+            };
+
+            current_guard.copy_from_slice(&node.serialize());
+            Self::write_node(&self.store, right_child_id, &right_node).unwrap();
+
+            let new_root = Internal {
+                keys: vec![promoted_key],
+                children: vec![current_id, right_child_id],
+            };
+            Self::write_node(&self.store, new_root_id, &Node::Internal(new_root)).unwrap();
+
+            self.root.store(new_root_id, Ordering::Release);
+
+            drop(current_guard);
+            current_id = new_root_id;
+            current_guard = self.store.write(current_id).unwrap();
+            // We don't need to deserialize node here because the loop does it immediately next.
+        }
+
+        // 3. Monkey Bars Traversal
         loop {
-            let mut node = Self::read_node(&mut self.store, current_id).unwrap();
+            // FIX: MUST deserialize at the top of the loop to prevent double-locking!
+            let mut node = Node::deserialize(&*current_guard);
 
             if node.is_leaf() {
-                // Tightly scoped mutable borrow
                 let inserted = if let Node::Leaf(leaf) = &mut node {
                     match leaf.find_pos(&key) {
                         Ok(i) => {
-                            leaf.entries[i].value = value;
+                            leaf.entries[i].value = value.clone();
                             false
                         }
                         Err(i) => {
-                            leaf.entries.insert(i, LeafEntry { key, value });
+                            leaf.entries.insert(i, LeafEntry { key: key.clone(), value: value.clone() });
                             true
                         }
                     }
-                } else {
-                    unreachable!()
-                };
+                } else { unreachable!() };
 
-                // Mutable borrow is gone, safe to write!
-                Self::write_node(&mut self.store, current_id, &node).unwrap();
+                current_guard.copy_from_slice(&node.serialize());
+
                 if inserted {
-                    self.len += 1;
+                    self.len.fetch_add(1, Ordering::Relaxed);
                 }
-                break; // DONE!
+                break;
+
             } else {
-                // Immutable lookahead
-                let mut ci = if let Node::Internal(internal) = &node {
-                    internal.child_index(&key)
-                } else {
-                    unreachable!()
-                };
-                let mut child_id = if let Node::Internal(internal) = &node {
-                    internal.children[ci]
-                } else {
-                    unreachable!()
+                let mut ci = if let Node::Internal(internal) = &node { internal.child_index(&key) } else { unreachable!() };
+                let mut child_id = if let Node::Internal(internal) = &node { internal.children[ci] } else { unreachable!() };
+
+                // Peek at the child safely
+                let child_is_full = {
+                    let child_guard = self.store.read(child_id).unwrap();
+                    let child_node = Node::deserialize(&*child_guard);
+                    child_node.key_count() == max_keys
                 };
 
-                let child_count = Self::read_node(&mut self.store, child_id)
-                    .unwrap()
-                    .key_count();
-
-                // Proactive Split
-                if child_count == max_keys {
-                    // Tightly scoped mutable balance
+                if child_is_full {
                     if let Node::Internal(internal) = &mut node {
-                        Self::balance_window(internal, ci, self.t, max_keys, &mut self.store);
-                    }
-
-                    // Safe to write!
-                    Self::write_node(&mut self.store, current_id, &node).unwrap();
-
-                    // Recompute immutably because keys shifted!
-                    if let Node::Internal(internal) = &node {
+                        Self::balance_window(internal, ci, self.t, max_keys, &self.store);
                         ci = internal.child_index(&key);
                         child_id = internal.children[ci];
                     }
+                    current_guard.copy_from_slice(&node.serialize());
                 }
 
-                // Move down to the safe child
+                // Lock coupling: Grab child BEFORE dropping parent
+                let next_guard = self.store.write(child_id).unwrap();
+                drop(current_guard);
+                current_guard = next_guard;
                 current_id = child_id;
             }
         }
     }
 
-    pub fn search(&mut self, key: &Key) -> Option<Vec<u8>> {
-        let mut current_id = self.root;
+    pub fn search(&self, key: &Key) -> Option<Vec<u8>> {
+        let mut current_id = self.root.load(Ordering::Acquire);
+        let mut current_guard = self.store.read(current_id).unwrap();
+        while self.root.load(Ordering::Acquire) != current_id {
+            drop(current_guard);
+            current_id = self.root.load(Ordering::Acquire);
+            current_guard = self.store.read(current_id).unwrap();
+        }
 
         loop {
-            let node = Self::read_node(&mut self.store, current_id).unwrap();
+            // Re-deserialize at the top of EVERY loop!
+            let node = Node::deserialize(&*current_guard);
 
             match node {
                 Node::Leaf(leaf) => {
-                    return match leaf.entries.binary_search_by(|e| e.key.cmp(key)) {
+                    return match leaf.find_pos(key) {
                         Ok(i) => Some(leaf.entries[i].value.clone()),
                         Err(_) => None,
                     };
                 }
                 Node::Internal(internal) => {
                     let ci = internal.child_index(key);
-                    current_id = internal.children[ci];
+                    let child_id = internal.children[ci];
+
+                    // Lock coupling: Grab child BEFORE dropping parent
+                    let child_guard = self.store.read(child_id).unwrap();
+                    drop(current_guard);
+                    current_guard = child_guard;
                 }
             }
         }
     }
 
-    pub fn remove(&mut self, key: &Key) -> Option<Vec<u8>> {
-        let mut current_id = self.root;
+    pub fn remove(&self, key: &Key) -> Option<Vec<u8>> {
+        let mut current_id = self.root.load(Ordering::Acquire);
+        let mut current_guard = self.store.write(current_id).unwrap();
+        while self.root.load(Ordering::Acquire) != current_id {
+            drop(current_guard);
+            current_id = self.root.load(Ordering::Acquire);
+            current_guard = self.store.write(current_id).unwrap();
+        }
+
         let mut removed_value = None;
 
-        // 1. Iterative Top-Down Remove
+        // 2. Monkey Bars Traversal
         loop {
-            let mut node = Self::read_node(&mut self.store, current_id).unwrap();
+            // FIX: MUST deserialize at the top of the loop!
+            let mut node = Node::deserialize(&*current_guard);
 
             if node.is_leaf() {
-                // Tightly scoped mutable borrow
                 removed_value = if let Node::Leaf(leaf) = &mut node {
                     match leaf.find_pos(key) {
                         Ok(i) => Some(leaf.entries.remove(i).value),
                         Err(_) => None,
                     }
-                } else {
-                    unreachable!()
-                };
+                } else { unreachable!() };
 
-                // Mutable borrow is gone, safe to write!
                 if removed_value.is_some() {
-                    Self::write_node(&mut self.store, current_id, &node).unwrap();
+                    current_guard.copy_from_slice(&node.serialize());
                 }
-                break; // DONE!
+                break;
             } else {
-                // Immutable lookahead
-                let mut ci = if let Node::Internal(internal) = &node {
-                    internal.child_index(key)
-                } else {
-                    unreachable!()
-                };
-                let mut child_id = if let Node::Internal(internal) = &node {
-                    internal.children[ci]
-                } else {
-                    unreachable!()
+                let mut ci = if let Node::Internal(internal) = &node { internal.child_index(key) } else { unreachable!() };
+                let mut child_id = if let Node::Internal(internal) = &node { internal.children[ci] } else { unreachable!() };
+
+                let child_is_starving = {
+                    let child_guard = self.store.read(child_id).unwrap();
+                    let child_node = Node::deserialize(&*child_guard);
+                    child_node.key_count() <= self.t - 1
                 };
 
-                let child_count = Self::read_node(&mut self.store, child_id)
-                    .unwrap()
-                    .key_count();
-
-                // Proactive Merge
-                if child_count <= self.t - 1 {
-                    // Tightly scoped mutable balance
+                if child_is_starving {
                     if let Node::Internal(internal) = &mut node {
-                        Self::balance_window(internal, ci, self.t, 2 * self.t - 1, &mut self.store);
-                    }
-
-                    // Safe to write!
-                    Self::write_node(&mut self.store, current_id, &node).unwrap();
-
-                    // Recompute immutably because keys shifted!
-                    if let Node::Internal(internal) = &node {
+                        Self::balance_window(internal, ci, self.t, 2 * self.t - 1, &self.store);
                         ci = internal.child_index(key);
                         child_id = internal.children[ci];
                     }
+                    current_guard.copy_from_slice(&node.serialize());
                 }
 
-                // Move down to the safe child
+                let next_guard = self.store.write(child_id).unwrap();
+                drop(current_guard);
+                current_guard = next_guard;
                 current_id = child_id;
             }
         }
 
-        // 2. Root empty check (Remains exactly the same)
-        let root_node = Self::read_node(&mut self.store, self.root).unwrap();
+        drop(current_guard);
+
+        // 3. Bypass empty root safely
+        let root_id = self.root.load(Ordering::Acquire);
+        let root_guard = self.store.write(root_id).unwrap();
+        let root_node = Node::deserialize(&*root_guard);
+
         if let Node::Internal(internal) = root_node {
             if internal.keys.is_empty() {
-                let old_root_id = self.root;
-                self.root = internal.children[0];
-                self.store.free(old_root_id).unwrap();
+                let new_root_id = internal.children[0];
+                self.root.store(new_root_id, Ordering::Release);
+                drop(root_guard);
+
+                // FIX: Do NOT free the page right now. Other threads might be currently
+                // blocked in the Validation Loop trying to lock it!
+                // In a production DB, we use Epoch-Based Reclamation (EBR) to free it later.
+                // self.store.free(root_id).unwrap();
             }
         }
 
         if removed_value.is_some() {
-            self.len -= 1;
+            self.len.fetch_sub(1, Ordering::Relaxed);
         }
 
         removed_value
     }
 
-    pub fn iter(&mut self) -> LeafIter<'_, S> {
-        let leaf_id = Self::leftmost_leaf(&mut self.store, self.root);
-        LeafIter::new(&mut self.store, leaf_id, 0, Bound::Unbounded)
+    pub fn iter(&self) -> LeafIter<'_, S> {
+        let root = self.root.load(Ordering::Acquire);
+        let leaf_id = Self::leftmost_leaf(&self.store, root);
+        LeafIter::new(&self.store, leaf_id, 0, Bound::Unbounded)
     }
 
-    pub fn range_from(&mut self, start: &Key, end: Bound<Key>) -> LeafIter<'_, S> {
-        let leaf_id = Self::find_leaf(&mut self.store, self.root, start);
+    pub fn range_from(&self, start: &Key, end: Bound<Key>) -> LeafIter<'_, S> {
+        let root = self.root.load(Ordering::Acquire);
+        let leaf_id = Self::find_leaf(&self.store, root, start);
 
-        let node = Self::read_node(&mut self.store, leaf_id).unwrap();
+        let node = Self::read_node(&self.store, leaf_id).unwrap();
         let pos = if let Node::Leaf(leaf) = node {
             leaf.entries.partition_point(|e| &e.key < start)
         } else {
             0
         };
 
-        LeafIter::new(&mut self.store, leaf_id, pos, end)
+        LeafIter::new(&self.store, leaf_id, pos, end)
     }
 }
 
 impl<S: PageStore> BPlusTree<S> {
-    pub fn print_tree(&mut self) {
-        println!("BPlusTree {{ t={}, len={} }}", self.t, self.len);
-        Self::print_node(&mut self.store, self.root, 0);
+    pub fn print_tree(&self) {
+        let root = self.root.load(Ordering::Acquire);
+        let len = self.len.load(Ordering::Acquire);
+        println!("BPlusTree {{ t={}, len={} }}", self.t, len);
+        Self::print_node(&self.store, root, 0);
     }
 
-    fn print_node(store: &mut S, node_id: PageId, depth: usize) {
+    fn print_node(store: &S, node_id: PageId, depth: usize) {
         let indent = "  ".repeat(depth);
         let node = Self::read_node(store, node_id).unwrap();
         match node {
@@ -900,7 +949,7 @@ impl<S: PageStore> BPlusTree<S> {
 }
 
 pub struct LeafIter<'a, S: PageStore> {
-    store: &'a mut S,
+    store: &'a S,
     current_id: Option<PageId>,
     current_leaf: Option<Leaf>,
     pos: usize,
@@ -908,7 +957,7 @@ pub struct LeafIter<'a, S: PageStore> {
 }
 
 impl<'a, S: PageStore> LeafIter<'a, S> {
-    fn new(store: &'a mut S, start_id: PageId, pos: usize, end: Bound<Key>) -> Self {
+    fn new(store: &'a S, start_id: PageId, pos: usize, end: Bound<Key>) -> Self {
         LeafIter {
             store,
             current_id: Some(start_id),
@@ -929,9 +978,8 @@ impl<'a, S: PageStore> Iterator for LeafIter<'a, S> {
                 let node = BPlusTree::<S>::read_node(self.store, id).ok()?;
                 if let Node::Leaf(leaf) = node {
                     self.current_leaf = Some(leaf);
-                    // On fresh load, position is 0 except the first time when pos was already populated in new()
                 } else {
-                    return None; // Should never happen
+                    return None;
                 }
             }
 
@@ -957,7 +1005,7 @@ impl<'a, S: PageStore> Iterator for LeafIter<'a, S> {
 
             self.current_id = leaf.next;
             self.current_leaf = None;
-            self.pos = 0; // Reset position for next block
+            self.pos = 0;
         }
     }
 }
