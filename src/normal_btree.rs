@@ -1,4 +1,4 @@
-use crate::store::PageId;
+use crate::store::{NULL_PAGE, PAGE_SIZE, PageId, PageStore, PageType};
 use std::collections::Bound;
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -90,16 +90,12 @@ impl From<char> for Key {
 }
 
 impl Key {
-    pub fn from_u64(v: u64) -> Self {
-        Key(v.to_be_bytes().to_vec())
-    }
-
-    pub fn from_str(s: &str) -> Self {
-        Key(s.as_bytes().to_vec())
-    }
-
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -115,6 +111,7 @@ impl PartialOrd for Key {
     }
 }
 
+#[derive(Clone)]
 struct LeafEntry {
     key: Key,
     value: Vec<u8>,
@@ -122,25 +119,96 @@ struct LeafEntry {
 
 struct Leaf {
     entries: Vec<LeafEntry>,
-    next: *mut Leaf,
+    next: Option<PageId>,
 }
 
 impl Leaf {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-            next: std::ptr::null_mut(),
+            next: None,
         }
     }
 
     fn find_pos(&self, key: &Key) -> Result<usize, usize> {
         self.entries.binary_search_by(|e| e.key.cmp(key))
     }
+
+    pub fn serialize(&self) -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+
+        buf[0] = PageType::Leaf.into();
+
+        let entries = self.entries.len() as u16;
+        buf[1..3].copy_from_slice(&entries.to_le_bytes());
+        buf[3..11].copy_from_slice(&match self.next {
+            Some(p) => p.to_le_bytes(),
+            None => NULL_PAGE.to_le_bytes(),
+        });
+
+        let mut offset = 11;
+        for entry in &self.entries {
+            let key_len = entry.key.len();
+            let value_len = entry.value.len();
+
+            buf[offset..offset + 2].copy_from_slice(&(key_len as u16).to_be_bytes());
+            offset += 2;
+            buf[offset..offset + key_len].copy_from_slice(entry.key.as_bytes());
+            offset += key_len;
+            buf[offset..offset + 2].copy_from_slice(&(value_len as u16).to_be_bytes());
+            offset += 2;
+            buf[offset..offset + value_len].copy_from_slice(&entry.value);
+            offset += value_len;
+        }
+
+        buf
+    }
+
+    pub fn deserialize(bytes: &[u8; PAGE_SIZE]) -> Result<Self, &'static str> {
+        if PageType::from(bytes[0]) != PageType::Leaf {
+            return Err("Not a leaf");
+        }
+
+        let entries_count = u16::from_le_bytes(bytes[1..3].try_into().unwrap()) as usize;
+        let next_page = PageId::from_le_bytes(bytes[3..11].try_into().unwrap());
+
+        let mut offset = 11;
+        let mut entries: Vec<LeafEntry> = Vec::with_capacity(entries_count);
+        for _ in 0..entries_count {
+            let key_len =
+                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let key: Vec<u8> = Vec::from(&bytes[offset..offset + key_len]);
+            offset += key_len;
+
+            let value_len =
+                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+
+            let value: Vec<u8> = Vec::from(&bytes[offset..offset + value_len]);
+            offset += value_len;
+
+            entries.push(LeafEntry {
+                key: Key(key),
+                value,
+            })
+        }
+
+        Ok(Leaf {
+            entries,
+            next: if next_page == NULL_PAGE {
+                None
+            } else {
+                Some(next_page)
+            },
+        })
+    }
 }
 
+#[derive(Clone)]
 struct Internal {
     keys: Vec<Key>,
-    children: Vec<Box<Node>>,
+    children: Vec<PageId>,
 }
 
 impl Internal {
@@ -157,6 +225,66 @@ impl Internal {
             Err(i) => i,
         }
     }
+
+    pub fn serialize(&self) -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+
+        buf[0] = PageType::Internal.into();
+
+        let entries = self.keys.len() as u16;
+        buf[1..3].copy_from_slice(&entries.to_be_bytes());
+
+        let mut offset = 3;
+
+        for key in &self.keys {
+            let key_len = key.len();
+
+            buf[offset..offset + 2].copy_from_slice(&(key_len as u16).to_be_bytes());
+            offset += 2;
+
+            buf[offset..offset + key_len].copy_from_slice(key.as_bytes());
+            offset += key_len;
+        }
+
+        for children in &self.children {
+            buf[offset..offset + 8].copy_from_slice(&children.to_be_bytes());
+            offset += 8;
+        }
+
+        buf
+    }
+
+    pub fn deserialize(bytes: &[u8; PAGE_SIZE]) -> Result<Internal, &'static str> {
+        if PageType::from(bytes[0]) != PageType::Internal {
+            return Err("Not internal");
+        }
+
+        let total_keys = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
+
+        let mut keys: Vec<Key> = Vec::with_capacity(total_keys);
+        let mut children: Vec<PageId> = Vec::with_capacity(total_keys + 1);
+
+        let mut offset = 3;
+
+        for _ in 0..total_keys {
+            let key_len =
+                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let key: Key = Key(Vec::from(&bytes[offset..offset + key_len]));
+            offset += key_len;
+
+            keys.push(key);
+        }
+
+        for _ in 0..total_keys + 1 {
+            let child = PageId::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+
+            children.push(child);
+        }
+
+        Ok(Internal { keys, children })
+    }
 }
 
 enum Node {
@@ -165,10 +293,18 @@ enum Node {
 }
 
 impl Node {
-    fn first_key(&self) -> Option<&Key> {
+    fn first_key<S: PageStore>(&self, store: &mut S) -> Option<Key> {
         match self {
-            Node::Leaf(leaf) => leaf.entries.first().map(|e| &e.key),
-            Node::Internal(internal) => internal.children.first().and_then(|c| c.first_key()),
+            Node::Leaf(leaf) => leaf.entries.first().map(|e| e.key.clone()),
+            Node::Internal(internal) => {
+                internal
+                    .children
+                    .first()
+                    .and_then(|&c| match store.read(c) {
+                        Ok(b) => Node::deserialize(&b).first_key(store),
+                        Err(_) => None,
+                    })
+            }
         }
     }
 
@@ -186,66 +322,109 @@ impl Node {
     fn is_internal(&self) -> bool {
         matches!(self, Node::Internal(..))
     }
+
+    fn serialize(&self) -> [u8; PAGE_SIZE] {
+        match self {
+            Node::Leaf(leaf) => leaf.serialize(),
+            Node::Internal(internal) => internal.serialize(),
+        }
+    }
+
+    fn deserialize(bytes: &[u8; PAGE_SIZE]) -> Node {
+        if PageType::from(bytes[0]) == PageType::Leaf {
+            Node::Leaf(Leaf::deserialize(bytes).unwrap())
+        } else {
+            Node::Internal(Internal::deserialize(bytes).unwrap())
+        }
+    }
 }
 
-struct SplitResult {
-    promoted_key: Key,
-    right_child: Box<Node>,
+impl TryFrom<Node> for Leaf {
+    type Error = &'static str;
+    fn try_from(value: Node) -> Result<Self, Self::Error> {
+        match value {
+            Node::Leaf(leaf) => Ok(leaf),
+            Node::Internal(_) => Err("Not a leaf"),
+        }
+    }
 }
 
-pub struct BPlusTree {
+impl TryFrom<Node> for Internal {
+    type Error = &'static str;
+    fn try_from(value: Node) -> Result<Self, Self::Error> {
+        match value {
+            Node::Internal(internal) => Ok(internal),
+            Node::Leaf(_) => Err("Not an internal node"),
+        }
+    }
+}
+
+impl From<Leaf> for Node {
+    fn from(value: Leaf) -> Self {
+        Node::Leaf(value)
+    }
+}
+
+impl From<Internal> for Node {
+    fn from(value: Internal) -> Self {
+        Node::Internal(value)
+    }
+}
+
+#[derive(Debug)]
+pub struct BPlusTree<S: PageStore> {
     t: usize,
-    root: Box<Node>,
+    root: PageId,
     len: usize,
+    store: S,
 }
 
-impl BPlusTree {
-    fn split_child(parent: &mut Internal, ci: usize, t: usize) -> SplitResult {
-        match parent.children[ci].as_mut() {
+impl<S: PageStore> BPlusTree<S> {
+    fn split_root_child(store: &mut S, old_root_id: PageId, t: usize) -> (Key, PageId) {
+        let mut old_root = Self::read_node(store, old_root_id).unwrap();
+
+        // 1. Mutate old_root and build the new right_node, returning what we need.
+        let (promoted_key, right_id, right_node) = match &mut old_root {
             Node::Leaf(left) => {
                 let right_entries = left.entries.split_off(t);
                 let promoted_key = right_entries[0].key.clone();
 
-                let mut right_leaf = Leaf::new();
-                right_leaf.next = left.next;
-                right_leaf.entries = right_entries;
-
-                let mut right_box = Box::new(Node::Leaf(right_leaf));
-
-                let right_ptr = match right_box.as_mut() {
-                    Node::Leaf(rl) => rl as *mut Leaf,
-                    _ => unreachable!(),
+                let right_id = Self::allocate_leaf(store).unwrap();
+                let right_leaf = Leaf {
+                    entries: right_entries,
+                    next: left.next,
                 };
 
-                left.next = right_ptr;
+                left.next = Some(right_id);
 
-                SplitResult {
-                    promoted_key,
-                    right_child: right_box,
-                }
+                (promoted_key, right_id, Node::Leaf(right_leaf))
             }
-            Node::Internal(internal) => {
+            Node::Internal(left) => {
                 let mid = t - 1;
+                let promoted_key = left.keys[mid].clone();
 
-                let promoted_key = internal.keys[mid].clone();
+                let mut right_keys = left.keys.split_off(mid);
+                right_keys.remove(0); // Removing the promoted key entirely
+                let right_children = left.children.split_off(mid + 1);
 
-                let mut right_keys = internal.keys.split_off(mid);
-                right_keys.remove(0);
+                let right_id = Self::allocate_internal(store).unwrap();
+                let right_node = Internal {
+                    keys: right_keys,
+                    children: right_children,
+                };
 
-                let right_children = internal.children.split_off(mid + 1);
-
-                SplitResult {
-                    promoted_key,
-                    right_child: Box::new(Node::Internal(Internal {
-                        keys: right_keys,
-                        children: right_children,
-                    })),
-                }
+                (promoted_key, right_id, Node::Internal(right_node))
             }
-        }
+        };
+
+        // 2. The mutable borrow on old_root is now GONE. We can safely write it!
+        Self::write_node(store, old_root_id, &old_root).unwrap();
+        Self::write_node(store, right_id, &right_node).unwrap();
+
+        (promoted_key, right_id)
     }
 
-    fn balance_window(parent: &mut Internal, ci: usize, t: usize, max_keys: usize) {
+    fn balance_window(parent: &mut Internal, ci: usize, t: usize, max_keys: usize, store: &mut S) {
         const SIBLINGS_PER_SIDE: usize = 1;
 
         let left_bound = ci.saturating_sub(SIBLINGS_PER_SIDE);
@@ -254,44 +433,55 @@ impl BPlusTree {
 
         let total_entries: usize = window
             .iter()
-            .map(|&idx| parent.children[idx].key_count())
+            .map(|&idx| {
+                Self::read_node(store, parent.children[idx])
+                    .unwrap()
+                    .key_count()
+            })
             .sum();
 
+        // Safe Proactive Ceilings
         let needs_split = total_entries > window.len() * (max_keys - 1);
         let needs_merge = total_entries < window.len() * t;
-        let is_leaf = parent.children[window[0]].as_ref().is_leaf();
+
+        let is_leaf = Self::read_node(store, parent.children[window[0]])
+            .unwrap()
+            .is_leaf();
 
         if is_leaf {
-            let rightmost_next =
-                if let Node::Leaf(leaf) = parent.children[*window.last().unwrap()].as_ref() {
-                    leaf.next
-                } else {
-                    unreachable!()
-                };
+            let rightmost_next = if let Node::Leaf(leaf) =
+                Self::read_node(store, parent.children[*window.last().unwrap()]).unwrap()
+            {
+                leaf.next
+            } else {
+                unreachable!()
+            };
 
             // ── Pool ─────────────────────────────────────────────────
             let mut pooled: Vec<LeafEntry> = Vec::with_capacity(total_entries);
             for &idx in &window {
-                if let Node::Leaf(leaf) = parent.children[idx].as_mut() {
+                if let Node::Leaf(mut leaf) = Self::read_node(store, parent.children[idx]).unwrap()
+                {
                     pooled.extend(leaf.entries.drain(..));
                 }
             }
 
             // ── Needs split: add new node ─────────────────────────────
             if needs_split {
-                let new_leaf = Box::new(Node::Leaf(Leaf::new()));
-                parent.children.insert(right_bound + 1, new_leaf);
+                let new_leaf_id = Self::allocate_leaf(store).unwrap();
+                parent.children.insert(right_bound + 1, new_leaf_id);
                 parent
                     .keys
-                    .insert(right_bound, pooled.last().unwrap().key.clone());
+                    .insert(right_bound, pooled.last().unwrap().key.clone()); // Placeholder
                 window.push(right_bound + 1);
 
             // ── Needs merge: remove rightmost node ───────────────────
             } else if needs_merge && window.len() > 1 {
                 let remove_idx = *window.last().unwrap();
-                parent.children.remove(remove_idx);
+                let free_page = parent.children.remove(remove_idx);
                 parent.keys.remove(remove_idx - 1);
                 window.pop();
+                store.free(free_page).unwrap();
             }
 
             // ── Distribute evenly ─────────────────────────────────────
@@ -302,53 +492,38 @@ impl BPlusTree {
 
             for (i, &idx) in window.iter().enumerate() {
                 let end = start + chunk + if i < rem { 1 } else { 0 };
-                if let Node::Leaf(leaf) = parent.children[idx].as_mut() {
-                    leaf.entries
-                        .extend(pooled[start..end].iter().map(|e| LeafEntry {
-                            key: e.key.clone(),
-                            value: e.value.clone(),
-                        }));
-                }
-                start = end;
-            }
 
-            // ── Fix sibling pointers ──────────────────────────────────
-            for i in 0..window.len() - 1 {
-                let right_ptr = {
-                    if let Node::Leaf(r) = parent.children[window[i + 1]].as_mut() {
-                        r as *mut Leaf
-                    } else {
-                        unreachable!()
-                    }
+                let next_ptr = if i < window.len() - 1 {
+                    Some(parent.children[window[i + 1]])
+                } else {
+                    rightmost_next
                 };
-                if let Node::Leaf(l) = parent.children[window[i]].as_mut() {
-                    l.next = right_ptr;
-                }
-            }
 
-            // FIX: Hook up the final rightmost node in the window to the rest of the linked list!
-            if let Node::Leaf(l) = parent.children[*window.last().unwrap()].as_mut() {
-                l.next = rightmost_next;
+                let leaf = Leaf {
+                    entries: pooled[start..end].to_vec(),
+                    next: next_ptr,
+                };
+
+                Self::write_node(store, parent.children[idx], &Node::Leaf(leaf)).unwrap();
+                start = end;
             }
 
             // ── Update parent separator keys ──────────────────────────
             for i in 0..window.len() - 1 {
-                let first_key = if let Node::Leaf(leaf) = parent.children[window[i + 1]].as_ref() {
-                    leaf.entries[0].key.clone()
-                } else {
-                    unreachable!()
-                };
-                parent.keys[window[i]] = first_key;
+                let right_node = Self::read_node(store, parent.children[window[i + 1]]).unwrap();
+                if let Node::Leaf(leaf) = right_node {
+                    parent.keys[window[i]] = leaf.entries[0].key.clone();
+                }
             }
         } else {
             // ── Pool keys + children (record sizes first) ─────────────
             let mut pooled_keys: Vec<Key> = Vec::with_capacity(total_entries);
-            let mut pooled_children: Vec<Box<Node>> =
-                Vec::with_capacity(total_entries + window.len());
+            let mut pooled_children: Vec<PageId> = Vec::with_capacity(total_entries + window.len());
             let mut node_key_counts: Vec<usize> = Vec::with_capacity(window.len());
 
             for &idx in &window {
-                if let Node::Internal(n) = parent.children[idx].as_mut() {
+                if let Node::Internal(mut n) = Self::read_node(store, parent.children[idx]).unwrap()
+                {
                     node_key_counts.push(n.keys.len());
                     pooled_keys.extend(n.keys.drain(..));
                     pooled_children.extend(n.children.drain(..));
@@ -369,8 +544,8 @@ impl BPlusTree {
 
             // ── Needs split: add new internal node ────────────────────
             if needs_split {
-                let new_node = Box::new(Node::Internal(Internal::new()));
-                parent.children.insert(right_bound + 1, new_node);
+                let new_node_id = Self::allocate_internal(store).unwrap();
+                parent.children.insert(right_bound + 1, new_node_id);
                 parent
                     .keys
                     .insert(right_bound, interleaved.last().unwrap().clone());
@@ -379,17 +554,17 @@ impl BPlusTree {
             // ── Needs merge: remove rightmost node ───────────────────
             } else if needs_merge && window.len() > 1 {
                 let remove_idx = *window.last().unwrap();
-                parent.children.remove(remove_idx);
-                // the separator key between second-to-last and last comes DOWN
-                // into the interleaved pool (it already is — just remove from parent)
+                let free_page = parent.children.remove(remove_idx);
                 parent.keys.remove(remove_idx - 1);
                 window.pop();
+                store.free(free_page).unwrap();
             }
 
             // ── Distribute evenly ─────────────────────────────────────
             let n = window.len();
-            let total = interleaved.len();
-            let keys_for_children = total - (n - 1);
+
+            // FIXED BUG: Subtract CEO Keys to prevent Out of Bounds Index Math
+            let keys_for_children = interleaved.len() - (n - 1);
             let chunk = keys_for_children / n;
             let rem = keys_for_children % n;
             let mut key_start = 0;
@@ -400,14 +575,12 @@ impl BPlusTree {
                 let key_end = key_start + keys_for_node;
                 let child_end = child_start + keys_for_node + 1;
 
-                if let Node::Internal(internal) = parent.children[idx].as_mut() {
-                    internal
-                        .keys
-                        .extend_from_slice(&interleaved[key_start..key_end]);
-                    for c in pooled_children.drain(..keys_for_node + 1) {
-                        internal.children.push(c);
-                    }
-                }
+                let internal = Internal {
+                    keys: interleaved[key_start..key_end].to_vec(),
+                    children: pooled_children[child_start..child_end].to_vec(),
+                };
+
+                Self::write_node(store, parent.children[idx], &Node::Internal(internal)).unwrap();
 
                 // boundary key goes back up to parent as separator
                 if i < window.len() - 1 {
@@ -421,101 +594,202 @@ impl BPlusTree {
     }
 
     fn insert_non_full(
-        node: &mut Box<Node>,
+        store: &mut S,
+        node_id: PageId,
         key: Key,
         value: Vec<u8>,
         t: usize,
         max_keys: usize,
     ) -> bool {
-        match node.as_mut() {
-            Node::Leaf(leaf) => match leaf.find_pos(&key) {
-                Ok(i) => {
-                    leaf.entries[i].value = value;
-                    false
-                }
-                Err(i) => {
-                    leaf.entries.insert(i, LeafEntry { key, value });
-                    true
-                }
-            },
-            Node::Internal(internal) => {
-                let ci = internal.child_index(&key);
+        let mut node = Self::read_node(store, node_id).unwrap();
 
-                if internal.children[ci].key_count() == max_keys {
-                    Self::balance_window(internal, ci, t, max_keys);
+        if node.is_leaf() {
+            let inserted = if let Node::Leaf(leaf) = &mut node {
+                match leaf.find_pos(&key) {
+                    Ok(i) => {
+                        leaf.entries[i].value = value;
+                        false
+                    }
+                    Err(i) => {
+                        leaf.entries.insert(i, LeafEntry { key, value });
+                        true
+                    }
                 }
+            } else {
+                unreachable!()
+            };
 
-                let ci2 = internal.child_index(&key);
-                Self::insert_non_full(&mut internal.children[ci2], key, value, t, max_keys)
+            Self::write_node(store, node_id, &node).unwrap();
+            inserted
+        } else {
+            // Get initial child info immutably
+            let mut ci = if let Node::Internal(internal) = &node {
+                internal.child_index(&key)
+            } else {
+                unreachable!()
+            };
+
+            let child_count = {
+                let child_id = if let Node::Internal(internal) = &node {
+                    internal.children[ci]
+                } else {
+                    unreachable!()
+                };
+                Self::read_node(store, child_id).unwrap().key_count()
+            };
+
+            // If full, mutably borrow node to balance it
+            if child_count == max_keys {
+                if let Node::Internal(internal) = &mut node {
+                    Self::balance_window(internal, ci, t, max_keys, store);
+                    ci = internal.child_index(&key);
+                }
+                Self::write_node(store, node_id, &node).unwrap();
             }
+
+            // Get the final child id immutably
+            let next_child_id = if let Node::Internal(internal) = &node {
+                internal.children[ci]
+            } else {
+                unreachable!()
+            };
+
+            Self::insert_non_full(store, next_child_id, key, value, t, max_keys)
         }
     }
 
-    fn search_node<'a>(node: &'a Node, key: &Key) -> Option<&'a [u8]> {
+    fn search_node(store: &mut S, node_id: PageId, key: &Key) -> Option<Vec<u8>> {
+        let node = Self::read_node(store, node_id).unwrap();
         match node {
             Node::Leaf(leaf) => match leaf.entries.binary_search_by(|e| e.key.cmp(key)) {
-                Ok(i) => Some(&leaf.entries[i].value),
+                Ok(i) => Some(leaf.entries[i].value.clone()),
                 Err(_) => None,
             },
             Node::Internal(internal) => {
-                let child_idx = internal.child_index(&key);
-
-                Self::search_node(&internal.children[child_idx], &key)
+                let child_idx = internal.child_index(key);
+                Self::search_node(store, internal.children[child_idx], key)
             }
         }
     }
 
-    fn remove_from(node: &mut Box<Node>, key: &Key, t: usize) -> Option<Vec<u8>> {
-        match node.as_mut() {
-            Node::Leaf(leaf) => match leaf.find_pos(key) {
-                Ok(i) => Some(leaf.entries.remove(i).value),
-                Err(_) => None,
-            },
-            Node::Internal(internal) => {
-                let ci = internal.child_index(key);
+    fn remove_from(store: &mut S, node_id: PageId, key: &Key, t: usize) -> Option<Vec<u8>> {
+        let mut node = Self::read_node(store, node_id).unwrap();
 
-                // proactive balance before descending
-                if internal.children[ci].key_count() <= t - 1 {
-                    Self::balance_window(internal, ci, t, 2 * t - 1);
+        if node.is_leaf() {
+            let removed = if let Node::Leaf(leaf) = &mut node {
+                match leaf.find_pos(key) {
+                    Ok(i) => Some(leaf.entries.remove(i).value),
+                    Err(_) => None,
                 }
+            } else {
+                unreachable!()
+            };
 
-                // structure may have changed — recompute index
-                let ci2 = internal.child_index(key);
-                let removed = Self::remove_from(&mut internal.children[ci2], key, t);
+            if removed.is_some() {
+                Self::write_node(store, node_id, &node).unwrap();
+            }
+            removed
+        } else {
+            let mut ci = if let Node::Internal(internal) = &node {
+                internal.child_index(key)
+            } else {
+                unreachable!()
+            };
 
-                // FIX: If we removed a key and the first_key of the child changed, update our separator!
-                if removed.is_some() && ci2 > 0 {
-                    if let Some(first) = internal.children[ci2].first_key() {
-                        if &internal.keys[ci2 - 1] != first {
-                            internal.keys[ci2 - 1] = first.clone();
+            let child_count = {
+                let child_id = if let Node::Internal(internal) = &node {
+                    internal.children[ci]
+                } else {
+                    unreachable!()
+                };
+                Self::read_node(store, child_id).unwrap().key_count()
+            };
+
+            let mut changed = false;
+
+            if child_count <= t - 1 {
+                if let Node::Internal(internal) = &mut node {
+                    Self::balance_window(internal, ci, t, 2 * t - 1, store);
+                    ci = internal.child_index(key);
+                }
+                changed = true;
+            }
+
+            let next_child_id = if let Node::Internal(internal) = &node {
+                internal.children[ci]
+            } else {
+                unreachable!()
+            };
+
+            let removed = Self::remove_from(store, next_child_id, key, t);
+
+            if removed.is_some() && ci > 0 {
+                let child_node = Self::read_node(store, next_child_id).unwrap();
+                if let Some(first) = child_node.first_key(store) {
+                    if let Node::Internal(internal) = &mut node {
+                        if internal.keys[ci - 1] != first {
+                            internal.keys[ci - 1] = first;
+                            changed = true;
                         }
                     }
                 }
-
-                removed
             }
+
+            if changed {
+                Self::write_node(store, node_id, &node).unwrap();
+            }
+
+            removed
         }
     }
 
-    fn leftmost_leaf(node: &Node) -> *const Leaf {
+    fn leftmost_leaf(store: &mut S, node_id: PageId) -> PageId {
+        let node = Self::read_node(store, node_id).unwrap();
         match node {
-            Node::Leaf(leaf) => leaf as *const Leaf,
-            Node::Internal(internal) => Self::leftmost_leaf(&internal.children[0]),
+            Node::Leaf(_) => node_id,
+            Node::Internal(internal) => Self::leftmost_leaf(store, internal.children[0]),
         }
     }
 
-    fn find_leaf(node: &Node, key: &Key) -> *const Leaf {
+    fn find_leaf(store: &mut S, node_id: PageId, key: &Key) -> PageId {
+        let node = Self::read_node(store, node_id).unwrap();
         match node {
-            Node::Leaf(leaf) => leaf as *const Leaf,
+            Node::Leaf(_) => node_id,
             Node::Internal(internal) => {
                 let ci = internal.child_index(key);
-                Self::find_leaf(&internal.children[ci], key)
+                Self::find_leaf(store, internal.children[ci], key)
             }
         }
     }
 }
 
-impl BPlusTree {
+impl<S: PageStore> BPlusTree<S> {
+    pub fn allocate_leaf(store: &mut S) -> Result<PageId, S::Error> {
+        let id = store.allocate()?;
+        let page = Leaf::new().serialize();
+        store.write(id, &page)?;
+        Ok(id)
+    }
+
+    pub fn allocate_internal(store: &mut S) -> Result<PageId, S::Error> {
+        let id = store.allocate()?;
+        let page = Internal::new().serialize();
+        store.write(id, &page)?;
+        Ok(id)
+    }
+
+    fn read_node(store: &mut S, id: PageId) -> Result<Node, S::Error> {
+        let page = store.read(id)?;
+        Ok(Node::deserialize(&page))
+    }
+
+    fn write_node(store: &mut S, id: PageId, node: &Node) -> Result<(), S::Error> {
+        let page = node.serialize();
+        store.write(id, &page)
+    }
+}
+
+impl<S: PageStore> BPlusTree<S> {
     pub fn len(&self) -> usize {
         self.len
     }
@@ -524,56 +798,63 @@ impl BPlusTree {
         self.len == 0
     }
 }
-impl BPlusTree {
-    pub(crate) fn new(t: usize) -> Self {
+
+impl<S: PageStore> BPlusTree<S> {
+    pub fn new(t: usize, mut store: S) -> Result<Self, S::Error> {
         assert!(t >= 2, "Minimum degree must be >= 2");
 
-        Self {
+        let root = store.allocate()?;
+        let leaf = Leaf::new();
+        let page = leaf.serialize();
+        store.write(root, &page)?;
+
+        Ok(Self {
             t,
-            root: Box::new(Node::Leaf(Leaf::new())),
+            root,
             len: 0,
-        }
+            store,
+        })
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) {
+        let root_node = Self::read_node(&mut self.store, self.root).unwrap();
         let max_keys = 2 * self.t - 1;
 
-        if self.root.key_count() == max_keys {
-            let old_root =
-                std::mem::replace(&mut self.root, Box::new(Node::Internal(Internal::new())));
+        if root_node.key_count() == max_keys {
+            let new_root_id = Self::allocate_internal(&mut self.store).unwrap();
+            let old_root_id = std::mem::replace(&mut self.root, new_root_id);
 
-            let Node::Internal(new_root) = self.root.as_mut() else {
-                unreachable!()
+            let (promoted_key, right_child_id) =
+                Self::split_root_child(&mut self.store, old_root_id, self.t);
+
+            let new_root = Internal {
+                keys: vec![promoted_key],
+                children: vec![old_root_id, right_child_id],
             };
 
-            new_root.children.push(old_root);
-
-            let split = Self::split_child(new_root, 0, self.t);
-            new_root.keys.push(split.promoted_key);
-            new_root.children.push(split.right_child);
+            Self::write_node(&mut self.store, new_root_id, &Node::Internal(new_root)).unwrap();
         }
 
-        let inserted = Self::insert_non_full(&mut self.root, key, value, self.t, max_keys);
+        let inserted =
+            Self::insert_non_full(&mut self.store, self.root, key, value, self.t, max_keys);
         if inserted {
             self.len += 1
         }
     }
 
-    pub fn search(&self, key: &Key) -> Option<&'_ [u8]> {
-        Self::search_node(&self.root, &key)
+    pub fn search(&mut self, key: &Key) -> Option<Vec<u8>> {
+        Self::search_node(&mut self.store, self.root, key)
     }
 
     pub fn remove(&mut self, key: &Key) -> Option<Vec<u8>> {
-        let value = Self::remove_from(&mut self.root, key, self.t);
+        let value = Self::remove_from(&mut self.store, self.root, key, self.t);
 
-        if let Node::Internal(ref internal) = *self.root {
+        let root_node = Self::read_node(&mut self.store, self.root).unwrap();
+        if let Node::Internal(internal) = root_node {
             if internal.keys.is_empty() {
-                let old_root =
-                    std::mem::replace(&mut self.root, Box::new(Node::Internal(Internal::new())));
-                let Node::Internal(mut old_int) = *old_root else {
-                    unreachable!()
-                };
-                self.root = old_int.children.remove(0);
+                let old_root_id = self.root;
+                self.root = internal.children[0];
+                self.store.free(old_root_id).unwrap();
             }
         }
 
@@ -584,98 +865,108 @@ impl BPlusTree {
         value
     }
 
-    pub fn iter(&self) -> LeafIter<'_> {
-        let leaf = Self::leftmost_leaf(&self.root);
-        LeafIter::new(leaf, 0, Bound::Unbounded)
+    pub fn iter(&mut self) -> LeafIter<'_, S> {
+        let leaf_id = Self::leftmost_leaf(&mut self.store, self.root);
+        LeafIter::new(&mut self.store, leaf_id, 0, Bound::Unbounded)
     }
 
-    pub fn range_from(&self, start: &Key, end: Bound<Key>) -> LeafIter<'_> {
-        let leaf = Self::find_leaf(&self.root, start);
+    pub fn range_from(&mut self, start: &Key, end: Bound<Key>) -> LeafIter<'_, S> {
+        let leaf_id = Self::find_leaf(&mut self.store, self.root, start);
 
-        let pos = unsafe { (*leaf).entries.partition_point(|e| &e.key < start) };
+        let node = Self::read_node(&mut self.store, leaf_id).unwrap();
+        let pos = if let Node::Leaf(leaf) = node {
+            leaf.entries.partition_point(|e| &e.key < start)
+        } else {
+            0
+        };
 
-        LeafIter::new(leaf, pos, end)
+        LeafIter::new(&mut self.store, leaf_id, pos, end)
     }
 }
 
-impl BPlusTree {
-    pub fn print_tree(&self) {
+impl<S: PageStore> BPlusTree<S> {
+    pub fn print_tree(&mut self) {
         println!("BPlusTree {{ t={}, len={} }}", self.t, self.len);
-        Self::print_node(&self.root, 0);
+        Self::print_node(&mut self.store, self.root, 0);
     }
 
-    fn print_node(node: &Node, depth: usize) {
+    fn print_node(store: &mut S, node_id: PageId, depth: usize) {
         let indent = "  ".repeat(depth);
+        let node = Self::read_node(store, node_id).unwrap();
         match node {
             Node::Leaf(l) => {
-                let keys: Vec<_> = l.entries.iter().map(|e| &e.key).collect();
+                let keys: Vec<_> = l.entries.iter().map(|e| e.key.clone()).collect();
                 println!("{indent}Leaf {keys:?}");
             }
             Node::Internal(n) => {
                 println!("{indent}Internal {:?}", n.keys);
                 for c in &n.children {
-                    Self::print_node(c, depth + 1);
+                    Self::print_node(store, *c, depth + 1);
                 }
             }
         }
     }
 }
 
-pub struct LeafIter<'a> {
-    current: *const Leaf,
+pub struct LeafIter<'a, S: PageStore> {
+    store: &'a mut S,
+    current_id: Option<PageId>,
+    current_leaf: Option<Leaf>,
     pos: usize,
     end: Bound<Key>,
-    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> LeafIter<'a> {
-    fn new(current: *const Leaf, pos: usize, end: Bound<Key>) -> Self {
+impl<'a, S: PageStore> LeafIter<'a, S> {
+    fn new(store: &'a mut S, start_id: PageId, pos: usize, end: Bound<Key>) -> Self {
         LeafIter {
-            current,
+            store,
+            current_id: Some(start_id),
+            current_leaf: None,
             pos,
             end,
-            _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<'a> Iterator for LeafIter<'a> {
-    type Item = (&'a Key, &'a [u8]);
+impl<'a, S: PageStore> Iterator for LeafIter<'a, S> {
+    type Item = (Key, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.current.is_null() {
-                return None;
+            if self.current_leaf.is_none() {
+                let id = self.current_id?;
+                let node = BPlusTree::<S>::read_node(self.store, id).ok()?;
+                if let Node::Leaf(leaf) = node {
+                    self.current_leaf = Some(leaf);
+                    // On fresh load, position is 0 except the first time when pos was already populated in new()
+                } else {
+                    return None; // Should never happen
+                }
             }
-            let leaf = unsafe { &*self.current };
+
+            let leaf = self.current_leaf.as_ref().unwrap();
+
             if self.pos < leaf.entries.len() {
                 let e = &leaf.entries[self.pos];
 
-                return match &self.end {
-                    Bound::Included(key) => {
-                        if e.key <= *key {
-                            self.pos += 1;
-                            return Some((&e.key, &e.value));
-                        }
-
-                        None
-                    }
-                    Bound::Excluded(key) => {
-                        if e.key < *key {
-                            self.pos += 1;
-                            return Some((&e.key, &e.value));
-                        }
-
-                        None
-                    }
-                    Bound::Unbounded => {
-                        self.pos += 1;
-                        Some((&e.key, &e.value))
-                    }
+                let out = match &self.end {
+                    Bound::Included(key) if e.key <= *key => Some((e.key.clone(), e.value.clone())),
+                    Bound::Excluded(key) if e.key < *key => Some((e.key.clone(), e.value.clone())),
+                    Bound::Unbounded => Some((e.key.clone(), e.value.clone())),
+                    _ => None,
                 };
+
+                if out.is_some() {
+                    self.pos += 1;
+                    return out;
+                } else {
+                    return None;
+                }
             }
-            self.current = leaf.next as *const _;
-            self.pos = 0;
+
+            self.current_id = leaf.next;
+            self.current_leaf = None;
+            self.pos = 0; // Reset position for next block
         }
     }
 }
