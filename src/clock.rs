@@ -1,11 +1,12 @@
 use crate::store::{PAGE_SIZE, Page, PageId};
+use dashmap::{DashMap, Entry};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub trait Medium: Send + Sync {
     type Error: std::fmt::Debug;
@@ -60,71 +61,20 @@ impl Medium for InMemoryMedium {
     }
 }
 
-pub struct ClockReplacer {
-    num_frames: usize,
-    reference: Vec<bool>,
-    pinned: Vec<bool>,
-    hand: usize,
-}
-
-impl ClockReplacer {
-    pub fn new(num_frames: usize) -> Self {
-        Self {
-            num_frames,
-            reference: vec![false; num_frames],
-            pinned: vec![false; num_frames],
-            hand: 0,
-        }
-    }
-
-    pub fn pin(&mut self, frame_id: usize) {
-        self.pinned[frame_id] = true;
-        self.reference[frame_id] = true;
-    }
-
-    pub fn unpin(&mut self, frame_id: usize) {
-        self.pinned[frame_id] = false;
-        // reference bit intentionally left untouched
-    }
-
-    pub fn victim(&mut self) -> Option<usize> {
-        let mut examined = 0;
-        let limit = 2 * self.num_frames; // one lap to clear ref bits, one to evict
-
-        while examined < limit {
-            let current = self.hand;
-            self.hand = (self.hand + 1) % self.num_frames;
-
-            if self.pinned[current] {
-                examined += 1;
-                continue;
-            } else if self.reference[current] {
-                self.reference[current] = false;
-            } else {
-                self.pinned[current] = true;
-                return Some(current);
-            }
-
-            examined += 1;
-        }
-        None
-    }
-}
-
 struct FrameMeta {
     page_id: Option<PageId>,
     dirty: bool,
 }
-
 
 pub struct BufferPoolManager<M: Medium> {
     medium: M,
     data: Vec<RwLock<Page>>,
     meta: Vec<Mutex<FrameMeta>>,
     pin_counts: Vec<AtomicU32>,
-    page_table: Mutex<HashMap<PageId, usize>>,
+    ref_bits: Vec<AtomicBool>,
+    page_table: DashMap<PageId, usize>,
     free_list: Mutex<Vec<usize>>,
-    replacer: Mutex<ClockReplacer>,
+    clock_hand: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -149,67 +99,125 @@ impl<M: Medium> BufferPoolManager<M> {
                 })
                 .collect(),
             pin_counts: (0..num_frames).map(|_| AtomicU32::new(0)).collect(),
-            page_table: Mutex::new(HashMap::new()),
+            ref_bits: (0..num_frames).map(|_| AtomicBool::new(false)).collect(),
+            page_table: DashMap::new(),
             free_list: Mutex::new((0..num_frames).collect()),
-            replacer: Mutex::new(ClockReplacer::new(num_frames)),
+            clock_hand: AtomicUsize::new(0),
         }
     }
 
-    fn fetch_frame(&self, page_id: PageId) -> Result<usize, BpmError<M::Error>> {
-        let mut pt = self.page_table.lock();
+    fn get_victim(&self) -> Result<usize, BpmError<M::Error>> {
+        // 1. Fast path: The free list (Only used when the DB is first booting up)
+        if let Some(id) = self.free_list.lock().pop() {
+            self.pin_counts[id].store(1, Ordering::Release);
+            return Ok(id);
+        }
 
-        // cache hit
-        if let Some(&frame_id) = pt.get(&page_id) {
+        let num_frames = self.data.len();
+        let mut examined = 0;
+        let limit = 2 * num_frames; // Max spins before giving up
+
+        // 2. The Lock-Free CLOCK Sweep
+        while examined < limit {
+            let current = self.clock_hand.fetch_add(1, Ordering::Relaxed) % num_frames;
+
+            // If pinned, skip
+            if self.pin_counts[current].load(Ordering::Acquire) > 0 {
+                examined += 1;
+                continue;
+            }
+
+            // If referenced, clear the bit and give a second chance
+            if self.ref_bits[current].swap(false, Ordering::Release) {
+                examined += 1;
+                continue;
+            }
+
+            // Found a potential victim!
+            // try_lock prevents deadlocks if another thread is currently doing I/O on it.
+            if let Some(mut meta) = self.meta[current].try_lock() {
+                // Double-check the pin count inside the lock to be 100% sure
+                if self.pin_counts[current].load(Ordering::Acquire) > 0 {
+                    examined += 1;
+                    continue;
+                }
+
+                // WE CLAIMED IT! Evict the old page.
+                if meta.dirty {
+                    let old_data = self.data[current].read();
+                    self.medium
+                        .write_page(meta.page_id.unwrap(), &old_data)
+                        .map_err(BpmError::Medium)?;
+                    meta.dirty = false;
+                }
+
+                if let Some(old_id) = meta.page_id {
+                    self.page_table.remove(&old_id);
+                }
+
+                meta.page_id = None;
+
+                // Pre-pin it so nobody steals it from us while we return it
+                self.pin_counts[current].store(1, Ordering::Release);
+
+                return Ok(current);
+            }
+            examined += 1;
+        }
+
+        Err(BpmError::BufferFull)
+    }
+
+    fn fetch_frame(&self, page_id: PageId) -> Result<usize, BpmError<M::Error>> {
+        // 1. FAST PATH: Lock-free lookup
+        if let Some(ref_entry) = self.page_table.get(&page_id) {
+            let frame_id = *ref_entry;
             self.pin_counts[frame_id].fetch_add(1, Ordering::AcqRel);
-            self.replacer.lock().pin(frame_id);
+            self.ref_bits[frame_id].store(true, Ordering::Release);
             return Ok(frame_id);
         }
 
-        // cache miss: free list or evict
-        let frame_id = if let Some(id) = self.free_list.lock().pop() {
-            id
-        } else {
-            let victim_id = self.replacer.lock().victim().ok_or(BpmError::BufferFull)?;
+        // 2. CACHE MISS: Prepare a victim frame
+        let victim_id = self.get_victim()?;
 
-            let mut meta = self.meta[victim_id].lock();
-            if meta.dirty {
-                let old_data = self.data[victim_id].read();
-                self.medium
-                    .write_page(meta.page_id.unwrap(), &old_data)
-                    .map_err(BpmError::Medium)?;
+        // 3. DashMap Entry API (Prevents duplicate loading!)
+        match self.page_table.entry(page_id) {
+            Entry::Occupied(entry) => {
+                // Another thread beat us to the disk and already loaded it!
+                // Release the victim frame we claimed back to the free list.
+                self.pin_counts[victim_id].store(0, Ordering::Release);
+                self.free_list.lock().push(victim_id);
+
+                // Pin the frame that the other thread loaded
+                let frame_id = *entry.get();
+                self.pin_counts[frame_id].fetch_add(1, Ordering::AcqRel);
+                self.ref_bits[frame_id].store(true, Ordering::Release);
+                Ok(frame_id)
             }
-            if let Some(old_id) = meta.page_id {
-                pt.remove(&old_id);
+            Entry::Vacant(entry) => {
+                // We are the winner! We get to load the page.
+                entry.insert(victim_id);
+
+                // Lock the actual data. If Thread B gets a fast-path cache hit
+                // right now, they will wait safely at `RwLock::read()` for us to finish.
+                let mut frame_data = self.data[victim_id].write();
+
+                let fresh = self.medium.read_page(page_id).map_err(BpmError::Medium)?;
+                *frame_data = fresh;
+
+                self.meta[victim_id].lock().page_id = Some(page_id);
+                self.ref_bits[victim_id].store(true, Ordering::Release);
+
+                Ok(victim_id)
             }
-            meta.dirty = false;
-            meta.page_id = None;
-            victim_id
-        };
-
-        // FIX 1: Claim the page table entry before I/O, then drop the lock!
-        pt.insert(page_id, frame_id);
-        drop(pt);
-
-        // Block other threads from reading this frame while we do disk I/O
-        let mut frame_data = self.data[frame_id].write();
-        let fresh = self.medium.read_page(page_id).map_err(BpmError::Medium)?;
-        *frame_data = fresh;
-
-        self.meta[frame_id].lock().page_id = Some(page_id);
-        self.pin_counts[frame_id].store(1, Ordering::Release);
-        self.replacer.lock().pin(frame_id);
-
-        Ok(frame_id)
+        }
     }
 
     fn unpin(&self, frame_id: usize, mark_dirty: bool) {
         if mark_dirty {
             self.meta[frame_id].lock().dirty = true;
         }
-        let prev = self.pin_counts[frame_id].fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            self.replacer.lock().unpin(frame_id);
-        }
+        self.pin_counts[frame_id].fetch_sub(1, Ordering::AcqRel);
     }
 
     // -------------------------------------------------------------
@@ -244,12 +252,12 @@ impl<M: Medium> BufferPoolManager<M> {
     pub fn free(&self, id: PageId) -> Result<(), BpmError<M::Error>> {
         self.medium.free_page(id).map_err(BpmError::Medium)?;
 
-        // FIX 2: Evict the page from the buffer pool if it's currently in memory
-        let mut pt = self.page_table.lock();
-        if let Some(frame_id) = pt.remove(&id) {
+        // Lock-free remove from DashMap!
+        if let Some((_, frame_id)) = self.page_table.remove(&id) {
             let mut meta = self.meta[frame_id].lock();
             meta.page_id = None;
             meta.dirty = false;
+
             // Push back to free list to recycle the RAM instantly
             self.free_list.lock().push(frame_id);
         }
@@ -352,7 +360,7 @@ impl Medium for FilePageMedium {
         file.seek(SeekFrom::Start(Self::offset(id)))?;
 
         let mut page = Page::default();
-        let mut buf = &mut page.0[..];
+        let buf = &mut page.0[..];
         let mut total_read = 0;
 
         // Handle short reads explicitly rather than assuming read() fills the buffer
