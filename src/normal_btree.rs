@@ -295,21 +295,6 @@ enum Node {
 }
 
 impl Node {
-    fn first_key<S: Medium>(&self, store: &BufferPoolManager<S>) -> Option<Key> {
-        match self {
-            Node::Leaf(leaf) => leaf.entries.first().map(|e| e.key.clone()),
-            Node::Internal(internal) => {
-                internal
-                    .children
-                    .first()
-                    .and_then(|&c| match store.read(c) {
-                        Ok(b) => Node::deserialize(&b.0).first_key(store),
-                        Err(_) => None,
-                    })
-            }
-        }
-    }
-
     fn key_count(&self) -> usize {
         match self {
             Node::Leaf(leaf) => leaf.entries.len(),
@@ -377,17 +362,11 @@ pub struct BPlusTree<S: Medium> {
     t: usize,
     root: AtomicU64,
     len: AtomicUsize,
-    store: BufferPoolManager<S>,
+    pool: BufferPoolManager<S>,
 }
 
 impl<S: Medium> BPlusTree<S> {
-    fn balance_window(
-        parent: &mut Internal,
-        ci: usize,
-        t: usize,
-        max_keys: usize,
-        store: &BufferPoolManager<S>,
-    ) {
+    fn balance_window(&self, parent: &mut Internal, ci: usize, t: usize, max_keys: usize) {
         const SIBLINGS_PER_SIDE: usize = 1;
 
         let left_bound = ci.saturating_sub(SIBLINGS_PER_SIDE);
@@ -396,24 +375,22 @@ impl<S: Medium> BPlusTree<S> {
 
         let total_entries: usize = window
             .iter()
-            .map(|&idx| {
-                Self::read_node(store, parent.children[idx])
-                    .unwrap()
-                    .key_count()
-            })
+            .map(|&idx| self.read_node(parent.children[idx]).unwrap().key_count())
             .sum();
 
         // Safe Proactive Ceilings
         let needs_split = total_entries > window.len() * (max_keys - 1);
         let needs_merge = total_entries < window.len() * t;
 
-        let is_leaf = Self::read_node(store, parent.children[window[0]])
+        let is_leaf = self
+            .read_node(parent.children[window[0]])
             .unwrap()
             .is_leaf();
 
         if is_leaf {
-            let rightmost_next = if let Node::Leaf(leaf) =
-                Self::read_node(store, parent.children[*window.last().unwrap()]).unwrap()
+            let rightmost_next = if let Node::Leaf(leaf) = self
+                .read_node(parent.children[*window.last().unwrap()])
+                .unwrap()
             {
                 leaf.next
             } else {
@@ -423,15 +400,14 @@ impl<S: Medium> BPlusTree<S> {
             // ── Pool ─────────────────────────────────────────────────
             let mut pooled: Vec<LeafEntry> = Vec::with_capacity(total_entries);
             for &idx in &window {
-                if let Node::Leaf(mut leaf) = Self::read_node(store, parent.children[idx]).unwrap()
-                {
+                if let Node::Leaf(mut leaf) = self.read_node(parent.children[idx]).unwrap() {
                     pooled.extend(leaf.entries.drain(..));
                 }
             }
 
             // ── Needs split: add new node ─────────────────────────────
             if needs_split {
-                let new_leaf_id = Self::allocate_leaf(store).unwrap();
+                let new_leaf_id = self.allocate_leaf().unwrap();
                 parent.children.insert(right_bound + 1, new_leaf_id);
                 parent
                     .keys
@@ -444,7 +420,7 @@ impl<S: Medium> BPlusTree<S> {
                 let free_page = parent.children.remove(remove_idx);
                 parent.keys.remove(remove_idx - 1);
                 window.pop();
-                store.free(free_page).unwrap();
+                self.free(free_page).unwrap();
             }
 
             // ── Distribute evenly ─────────────────────────────────────
@@ -467,13 +443,14 @@ impl<S: Medium> BPlusTree<S> {
                     next: next_ptr,
                 };
 
-                Self::write_node(store, parent.children[idx], &Node::Leaf(leaf)).unwrap();
+                self.write_node(parent.children[idx], &Node::Leaf(leaf))
+                    .unwrap();
                 start = end;
             }
 
             // ── Update parent separator keys ──────────────────────────
             for i in 0..window.len() - 1 {
-                let right_node = Self::read_node(store, parent.children[window[i + 1]]).unwrap();
+                let right_node = self.read_node(parent.children[window[i + 1]]).unwrap();
                 if let Node::Leaf(leaf) = right_node {
                     parent.keys[window[i]] = leaf.entries[0].key.clone();
                 }
@@ -485,8 +462,7 @@ impl<S: Medium> BPlusTree<S> {
             let mut node_key_counts: Vec<usize> = Vec::with_capacity(window.len());
 
             for &idx in &window {
-                if let Node::Internal(mut n) = Self::read_node(store, parent.children[idx]).unwrap()
-                {
+                if let Node::Internal(mut n) = self.read_node(parent.children[idx]).unwrap() {
                     node_key_counts.push(n.keys.len());
                     pooled_keys.extend(n.keys.drain(..));
                     pooled_children.extend(n.children.drain(..));
@@ -507,7 +483,7 @@ impl<S: Medium> BPlusTree<S> {
 
             // ── Needs split: add new internal node ────────────────────
             if needs_split {
-                let new_node_id = Self::allocate_internal(store).unwrap();
+                let new_node_id = self.allocate_internal().unwrap();
                 parent.children.insert(right_bound + 1, new_node_id);
                 parent
                     .keys
@@ -520,7 +496,7 @@ impl<S: Medium> BPlusTree<S> {
                 let free_page = parent.children.remove(remove_idx);
                 parent.keys.remove(remove_idx - 1);
                 window.pop();
-                store.free(free_page).unwrap();
+                self.free(free_page).unwrap();
             }
 
             // ── Distribute evenly ─────────────────────────────────────
@@ -543,7 +519,8 @@ impl<S: Medium> BPlusTree<S> {
                     children: pooled_children[child_start..child_end].to_vec(),
                 };
 
-                Self::write_node(store, parent.children[idx], &Node::Internal(internal)).unwrap();
+                self.write_node(parent.children[idx], &Node::Internal(internal))
+                    .unwrap();
 
                 // boundary key goes back up to parent as separator
                 if i < window.len() - 1 {
@@ -556,61 +533,69 @@ impl<S: Medium> BPlusTree<S> {
         }
     }
 
-    fn leftmost_leaf(store: &BufferPoolManager<S>, node_id: PageId) -> PageId {
-        let node = Self::read_node(store, node_id).unwrap();
-        match node {
-            Node::Leaf(_) => node_id,
-            Node::Internal(internal) => Self::leftmost_leaf(store, internal.children[0]),
+    fn leftmost_leaf(&self, mut current_id: PageId) -> PageId {
+        loop {
+            let node = self.read_node(current_id).unwrap();
+            match node {
+                Node::Leaf(_) => return current_id,
+                Node::Internal(internal) => {
+                    current_id = internal.children[0]; // Crab down the left edge
+                }
+            }
         }
     }
 
-    fn find_leaf(store: &BufferPoolManager<S>, node_id: PageId, key: &Key) -> PageId {
-        let mut current_id = node_id;
+    fn find_leaf(&self, mut current_id: PageId, key: &Key) -> PageId {
         loop {
-            let node = Self::read_node(store, current_id).unwrap();
+            let node = self.read_node(current_id).unwrap();
             match node {
-                Node::Leaf(_) => return node_id,
+                Node::Leaf(_) => return current_id,
                 Node::Internal(internal) => {
                     let ci = internal.child_index(key);
-                    current_id = internal.children[ci];
+                    current_id = internal.children[ci]; // Crab down the exact path
                 }
             }
         }
     }
 }
 
-impl<S: Medium> BPlusTree<S> {
-    // 1. Read a Node (Grabs a Read Latch, reads bytes, and DROPS the Latch instantly)
-    // We only hold the read latch just long enough to copy the bytes into our memory `Node`.
-    fn read_node(store: &BufferPoolManager<S>, id: PageId) -> Result<Node, BpmError<S::Error>> {
-        let guard = store.read(id)?;
+impl<M: Medium> BPlusTree<M> {
+    /// Fetches a page and deserializes it into a Node in one step.
+    #[inline]
+    fn read_node(&self, id: PageId) -> Result<Node, BpmError<M::Error>> {
+        let guard = self.pool.read(id)?;
         Ok(Node::deserialize(&guard.0))
     }
 
-    // 2. Write a Node (Grabs a Write Latch, overwrites bytes, and DROPS the Latch instantly)
-    fn write_node(
-        store: &BufferPoolManager<S>,
-        id: PageId,
-        node: &Node,
-    ) -> Result<(), BpmError<S::Error>> {
-        let mut guard = store.write(id)?;
-        let page_bytes = node.serialize();
-        guard.copy_from_slice(&page_bytes);
+    /// Serializes a Node and writes it to the Buffer Pool.
+    #[inline]
+    fn write_node(&self, id: PageId, node: &Node) -> Result<(), BpmError<M::Error>> {
+        let mut guard = self.pool.write(id)?;
+        guard.0.copy_from_slice(&node.serialize());
         Ok(())
     }
 
-    pub fn allocate_leaf(store: &BufferPoolManager<S>) -> Result<PageId, BpmError<S::Error>> {
-        let (id, mut guard) = store.allocate()?;
-        let page = Leaf::new().serialize();
-        guard.copy_from_slice(&page);
+    /// Allocates a new page, serializes the Node into it, and returns the PageId.
+    #[inline]
+    fn allocate_node(&self, node: Node) -> Result<PageId, BpmError<M::Error>> {
+        let (id, mut guard) = self.pool.allocate()?;
+        guard.0.copy_from_slice(&node.serialize());
         Ok(id)
     }
 
-    pub fn allocate_internal(store: &BufferPoolManager<S>) -> Result<PageId, BpmError<S::Error>> {
-        let (id, mut guard) = store.allocate()?;
-        let page = Internal::new().serialize();
-        guard.copy_from_slice(&page);
-        Ok(id)
+    #[inline]
+    fn allocate_leaf(&self) -> Result<PageId, BpmError<M::Error>> {
+        self.allocate_node(Node::Leaf(Leaf::new()))
+    }
+
+    #[inline]
+    fn allocate_internal(&self) -> Result<PageId, BpmError<M::Error>> {
+        self.allocate_node(Node::Internal(Internal::new()))
+    }
+
+    #[inline]
+    fn free(&self, page_id: PageId) -> Result<(), BpmError<M::Error>> {
+        self.pool.free(page_id)
     }
 }
 
@@ -628,13 +613,19 @@ impl<S: Medium> BPlusTree<S> {
     pub fn new(t: usize, store: BufferPoolManager<S>) -> Result<Self, BpmError<S::Error>> {
         assert!(t >= 2, "Minimum degree must be >= 2");
 
-        let root = Self::allocate_leaf(&store)?;
+        let root_node = Node::Leaf(Leaf::new());
+
+        let root = {
+            let (id, mut guard) = store.allocate()?;
+            guard.0.copy_from_slice(&root_node.serialize());
+            id
+        };
 
         Ok(Self {
             t,
             root: AtomicU64::new(root),
             len: AtomicUsize::new(0),
-            store,
+            pool: store,
         })
     }
 
@@ -643,7 +634,7 @@ impl<S: Medium> BPlusTree<S> {
 
         let (mut current_id, mut current_guard) = loop {
             let id = self.root.load(Ordering::Acquire);
-            let guard = self.store.write(id).unwrap();
+            let guard = self.pool.write(id).unwrap();
 
             if self.root.load(Ordering::Acquire) == id {
                 break (id, guard); // Safely escape the loop with our locked root!
@@ -655,14 +646,14 @@ impl<S: Medium> BPlusTree<S> {
 
         // 2. Safely split the root
         if node.key_count() == max_keys {
-            let new_root_id = Self::allocate_internal(&self.store).unwrap();
+            let new_root_id = self.allocate_internal().unwrap();
 
             let (promoted_key, right_child_id, right_node) = match &mut node {
                 Node::Leaf(left) => {
                     let right_entries = left.entries.split_off(self.t);
                     let promoted_key = right_entries[0].key.clone();
 
-                    let right_id = Self::allocate_leaf(&self.store).unwrap();
+                    let right_id = self.allocate_leaf().unwrap();
                     let right_leaf = Leaf {
                         entries: right_entries,
                         next: left.next,
@@ -679,7 +670,7 @@ impl<S: Medium> BPlusTree<S> {
                     right_keys.remove(0);
                     let right_children = left.children.split_off(mid + 1);
 
-                    let right_id = Self::allocate_internal(&self.store).unwrap();
+                    let right_id = self.allocate_internal().unwrap();
                     let right_node = Internal {
                         keys: right_keys,
                         children: right_children,
@@ -690,19 +681,20 @@ impl<S: Medium> BPlusTree<S> {
             };
 
             current_guard.copy_from_slice(&node.serialize());
-            Self::write_node(&self.store, right_child_id, &right_node).unwrap();
+            self.write_node(right_child_id, &right_node).unwrap();
 
             let new_root = Internal {
                 keys: vec![promoted_key],
                 children: vec![current_id, right_child_id],
             };
-            Self::write_node(&self.store, new_root_id, &Node::Internal(new_root)).unwrap();
+            self.write_node(new_root_id, &Node::Internal(new_root))
+                .unwrap();
 
             self.root.store(new_root_id, Ordering::Release);
 
             drop(current_guard);
             current_id = new_root_id;
-            current_guard = self.store.write(current_id).unwrap();
+            current_guard = self.pool.write(current_id).unwrap();
             // We don't need to deserialize node here because the loop does it immediately next.
         }
 
@@ -753,14 +745,14 @@ impl<S: Medium> BPlusTree<S> {
 
                 // Peek at the child safely
                 let child_is_full = {
-                    let child_guard = self.store.read(child_id).unwrap();
+                    let child_guard = self.pool.read(child_id).unwrap();
                     let child_node = Node::deserialize(&child_guard.0);
                     child_node.key_count() == max_keys
                 };
 
                 if child_is_full {
                     if let Node::Internal(internal) = &mut node {
-                        Self::balance_window(internal, ci, self.t, max_keys, &self.store);
+                        self.balance_window(internal, ci, self.t, max_keys);
                         ci = internal.child_index(&key);
                         child_id = internal.children[ci];
                     }
@@ -768,7 +760,7 @@ impl<S: Medium> BPlusTree<S> {
                 }
 
                 // Lock coupling: Grab child BEFORE dropping parent
-                let next_guard = self.store.write(child_id).unwrap();
+                let next_guard = self.pool.write(child_id).unwrap();
                 drop(current_guard);
                 current_guard = next_guard;
                 current_id = child_id;
@@ -779,7 +771,7 @@ impl<S: Medium> BPlusTree<S> {
     pub fn search(&self, key: &Key) -> Option<Vec<u8>> {
         let (_, mut current_guard) = loop {
             let id = self.root.load(Ordering::Acquire);
-            let guard = self.store.read(id).unwrap();
+            let guard = self.pool.read(id).unwrap();
 
             if self.root.load(Ordering::Acquire) == id {
                 break (id, guard); // Safely escape the loop with our locked root!
@@ -803,7 +795,7 @@ impl<S: Medium> BPlusTree<S> {
                     let child_id = internal.children[ci];
 
                     // Lock coupling: Grab child BEFORE dropping parent
-                    let child_guard = self.store.read(child_id).unwrap();
+                    let child_guard = self.pool.read(child_id).unwrap();
                     drop(current_guard);
                     current_guard = child_guard;
                 }
@@ -814,7 +806,7 @@ impl<S: Medium> BPlusTree<S> {
     pub fn remove(&self, key: &Key) -> Option<Vec<u8>> {
         let (mut current_id, mut current_guard) = loop {
             let id = self.root.load(Ordering::Acquire);
-            let guard = self.store.write(id).unwrap();
+            let guard = self.pool.write(id).unwrap();
 
             if self.root.load(Ordering::Acquire) == id {
                 break (id, guard); // Safely escape the loop with our locked root!
@@ -856,21 +848,21 @@ impl<S: Medium> BPlusTree<S> {
                 };
 
                 let child_is_starving = {
-                    let child_guard = self.store.read(child_id).unwrap();
+                    let child_guard = self.pool.read(child_id).unwrap();
                     let child_node = Node::deserialize(&child_guard.0);
                     child_node.key_count() <= self.t - 1
                 };
 
                 if child_is_starving {
                     if let Node::Internal(internal) = &mut node {
-                        Self::balance_window(internal, ci, self.t, 2 * self.t - 1, &self.store);
+                        self.balance_window(internal, ci, self.t, 2 * self.t - 1);
                         ci = internal.child_index(key);
                         child_id = internal.children[ci];
                     }
                     current_guard.copy_from_slice(&node.serialize());
                 }
 
-                let next_guard = self.store.write(child_id).unwrap();
+                let next_guard = self.pool.write(child_id).unwrap();
                 drop(current_guard);
                 current_guard = next_guard;
                 current_id = child_id;
@@ -881,7 +873,7 @@ impl<S: Medium> BPlusTree<S> {
 
         // 3. Bypass empty root safely
         let root_id = self.root.load(Ordering::Acquire);
-        let root_guard = self.store.write(root_id).unwrap();
+        let root_guard = self.pool.write(root_id).unwrap();
         let root_node = Node::deserialize(&root_guard.0);
 
         if let Node::Internal(internal) = root_node {
@@ -906,7 +898,7 @@ impl<S: Medium> BPlusTree<S> {
 
     pub fn iter(&self) -> LeafIter<'_> {
         let root = self.root.load(Ordering::Acquire);
-        let leaf_id = Self::leftmost_leaf(&self.store, root);
+        let leaf_id = self.leftmost_leaf(root);
 
         // Passing `self` automatically acts as the `&dyn PageProvider`!
         LeafIter::new(self, leaf_id, 0, Bound::Unbounded)
@@ -914,9 +906,9 @@ impl<S: Medium> BPlusTree<S> {
 
     pub fn range_from(&self, start: &Key, end: Bound<Key>) -> LeafIter<'_> {
         let root = self.root.load(Ordering::Acquire);
-        let leaf_id = Self::find_leaf(&self.store, root, start);
+        let leaf_id = self.find_leaf(root, start);
 
-        let node = Self::read_node(&self.store, leaf_id).unwrap();
+        let node = self.read_node(leaf_id).unwrap();
         let pos = if let Node::Leaf(leaf) = node {
             leaf.entries.partition_point(|e| &e.key < start)
         } else {
@@ -932,12 +924,12 @@ impl<S: Medium> BPlusTree<S> {
         let root = self.root.load(Ordering::Acquire);
         let len = self.len.load(Ordering::Acquire);
         println!("BPlusTree {{ t={}, len={} }}", self.t, len);
-        Self::print_node(&self.store, root, 0);
+        self.print_node(root, 0);
     }
 
-    fn print_node(store: &BufferPoolManager<S>, node_id: PageId, depth: usize) {
+    fn print_node(&self, node_id: PageId, depth: usize) {
         let indent = "  ".repeat(depth);
-        let node = Self::read_node(store, node_id).unwrap();
+        let node = self.read_node(node_id).unwrap();
         match node {
             Node::Leaf(l) => {
                 let keys: Vec<_> = l.entries.iter().map(|e| e.key.clone()).collect();
@@ -946,7 +938,7 @@ impl<S: Medium> BPlusTree<S> {
             Node::Internal(n) => {
                 println!("{indent}Internal {:?}", n.keys);
                 for c in &n.children {
-                    Self::print_node(store, *c, depth + 1);
+                    self.print_node(*c, depth + 1);
                 }
             }
         }
@@ -960,7 +952,7 @@ trait PageProvider {
 
 impl<M: Medium> PageProvider for BPlusTree<M> {
     fn fetch_leaf(&self, id: PageId) -> Option<Leaf> {
-        let node = Self::read_node(&self.store, id).ok()?;
+        let node = self.read_node(id).ok()?;
         if let Node::Leaf(leaf) = node {
             Some(leaf)
         } else {
@@ -972,7 +964,7 @@ impl<M: Medium> PageProvider for BPlusTree<M> {
         // Just calling `read` brings the page into the Buffer Pool.
         // It drops immediately, so it doesn't hold any locks!
         // (In an async DB, you would spawn a background task here)
-        let _ = self.store.read(id);
+        let _ = self.pool.read(id);
     }
 }
 
