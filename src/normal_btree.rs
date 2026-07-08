@@ -302,7 +302,7 @@ impl Node {
                     .children
                     .first()
                     .and_then(|&c| match store.read(c) {
-                        Ok(b) => Node::deserialize(&b).first_key(store),
+                        Ok(b) => Node::deserialize(&b.0).first_key(store),
                         Err(_) => None,
                     })
             }
@@ -622,7 +622,7 @@ impl<S: PageStore> BPlusTree<S> {
     // We only hold the read latch just long enough to copy the bytes into our memory `Node`.
     fn read_node(store: &S, id: PageId) -> Result<Node, S::Error> {
         let guard = store.read(id)?;
-        Ok(Node::deserialize(&guard))
+        Ok(Node::deserialize(&guard.0))
     }
 
     // 2. Write a Node (Grabs a Write Latch, overwrites bytes, and DROPS the Latch instantly)
@@ -685,7 +685,7 @@ impl<S: PageStore> BPlusTree<S> {
             // If we don't break, `guard` is dropped right here!
         };
 
-        let mut node = Node::deserialize(&*current_guard);
+        let mut node = Node::deserialize(&current_guard.0);
 
         // 2. Safely split the root
         if node.key_count() == max_keys {
@@ -743,7 +743,7 @@ impl<S: PageStore> BPlusTree<S> {
         // 3. Monkey Bars Traversal
         loop {
             // FIX: MUST deserialize at the top of the loop to prevent double-locking!
-            let mut node = Node::deserialize(&*current_guard);
+            let mut node = Node::deserialize(&current_guard.0);
 
             if node.is_leaf() {
                 let inserted = if let Node::Leaf(leaf) = &mut node {
@@ -788,7 +788,7 @@ impl<S: PageStore> BPlusTree<S> {
                 // Peek at the child safely
                 let child_is_full = {
                     let child_guard = self.store.read(child_id).unwrap();
-                    let child_node = Node::deserialize(&*child_guard);
+                    let child_node = Node::deserialize(&child_guard.0);
                     child_node.key_count() == max_keys
                 };
 
@@ -823,7 +823,7 @@ impl<S: PageStore> BPlusTree<S> {
 
         loop {
             // Re-deserialize at the top of EVERY loop!
-            let node = Node::deserialize(&*current_guard);
+            let node = Node::deserialize(&current_guard.0);
 
             match node {
                 Node::Leaf(leaf) => {
@@ -861,7 +861,7 @@ impl<S: PageStore> BPlusTree<S> {
         // 2. Monkey Bars Traversal
         loop {
             // FIX: MUST deserialize at the top of the loop!
-            let mut node = Node::deserialize(&*current_guard);
+            let mut node = Node::deserialize(&current_guard.0);
 
             if node.is_leaf() {
                 removed_value = if let Node::Leaf(leaf) = &mut node {
@@ -891,7 +891,7 @@ impl<S: PageStore> BPlusTree<S> {
 
                 let child_is_starving = {
                     let child_guard = self.store.read(child_id).unwrap();
-                    let child_node = Node::deserialize(&*child_guard);
+                    let child_node = Node::deserialize(&child_guard.0);
                     child_node.key_count() <= self.t - 1
                 };
 
@@ -916,7 +916,7 @@ impl<S: PageStore> BPlusTree<S> {
         // 3. Bypass empty root safely
         let root_id = self.root.load(Ordering::Acquire);
         let root_guard = self.store.write(root_id).unwrap();
-        let root_node = Node::deserialize(&*root_guard);
+        let root_node = Node::deserialize(&root_guard.0);
 
         if let Node::Internal(internal) = root_node {
             if internal.keys.is_empty() {
