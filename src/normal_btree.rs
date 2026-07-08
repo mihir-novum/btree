@@ -142,10 +142,10 @@ impl Leaf {
         buf[0] = PageType::Leaf.into();
 
         let entries = self.entries.len() as u16;
-        buf[1..3].copy_from_slice(&entries.to_le_bytes());
+        buf[1..3].copy_from_slice(&entries.to_be_bytes());
         buf[3..11].copy_from_slice(&match self.next {
-            Some(p) => p.to_le_bytes(),
-            None => NULL_PAGE.to_le_bytes(),
+            Some(p) => p.to_be_bytes(),
+            None => NULL_PAGE.to_be_bytes(),
         });
 
         let mut offset = 11;
@@ -171,8 +171,8 @@ impl Leaf {
             return Err("Not a leaf");
         }
 
-        let entries_count = u16::from_le_bytes(bytes[1..3].try_into().unwrap()) as usize;
-        let next_page = PageId::from_le_bytes(bytes[3..11].try_into().unwrap());
+        let entries_count = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
+        let next_page = PageId::from_be_bytes(bytes[3..11].try_into().unwrap());
 
         let mut offset = 11;
         let mut entries: Vec<LeafEntry> = Vec::with_capacity(entries_count);
@@ -300,6 +300,11 @@ impl Node {
             Node::Leaf(leaf) => leaf.entries.len(),
             Node::Internal(internal) => internal.keys.len(),
         }
+    }
+
+    #[inline]
+    pub fn peek_key_count(bytes: &[u8; PAGE_SIZE]) -> usize {
+        u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize
     }
 
     fn is_leaf(&self) -> bool {
@@ -746,8 +751,7 @@ impl<S: Medium> BPlusTree<S> {
                 // Peek at the child safely
                 let child_is_full = {
                     let child_guard = self.pool.read(child_id).unwrap();
-                    let child_node = Node::deserialize(&child_guard.0);
-                    child_node.key_count() == max_keys
+                    Node::peek_key_count(&child_guard.0) == max_keys // Zero allocations!
                 };
 
                 if child_is_full {
@@ -849,8 +853,7 @@ impl<S: Medium> BPlusTree<S> {
 
                 let child_is_starving = {
                     let child_guard = self.pool.read(child_id).unwrap();
-                    let child_node = Node::deserialize(&child_guard.0);
-                    child_node.key_count() <= self.t - 1
+                    Node::peek_key_count(&child_guard.0) <= self.t - 1 // Zero allocations!
                 };
 
                 if child_is_starving {
