@@ -1,4 +1,5 @@
 use crate::clock::{BpmError, BufferPoolManager, Medium};
+use crate::page::SlottedPage;
 use crate::store::{NULL_PAGE, PAGE_SIZE, PageId, PageType};
 use std::collections::Bound;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -50,7 +51,7 @@ macro_rules! impl_from_int {
         $(
             impl From<$t> for Key {
                 fn from(v: $t) -> Self {
-                    Self(v.to_be_bytes().to_vec())
+                    Self(v.to_le_bytes().to_vec())
                 }
             }
         )*
@@ -67,7 +68,7 @@ macro_rules! impl_from_float {
         $(
             impl From<$t> for Key {
                 fn from(v: $t) -> Self {
-                    Self(v.to_be_bytes().to_vec())
+                    Self(v.to_le_bytes().to_vec())
                 }
             }
         )*
@@ -138,70 +139,47 @@ impl Leaf {
 
     pub fn serialize(&self) -> [u8; PAGE_SIZE] {
         let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 1; // Leaf
+        buf[1..3].copy_from_slice(&(self.entries.len() as u16).to_le_bytes());
+        buf[5..13].copy_from_slice(&self.next.unwrap_or(u64::MAX).to_le_bytes());
 
-        buf[0] = PageType::Leaf.into();
+        let mut free = PAGE_SIZE;
+        for (i, entry) in self.entries.iter().enumerate() {
+            let k = entry.key.as_bytes();
+            let v = &entry.value;
+            let size = 4 + k.len() + v.len();
+            free -= size;
 
-        let entries = self.entries.len() as u16;
-        buf[1..3].copy_from_slice(&entries.to_be_bytes());
-        buf[3..11].copy_from_slice(&match self.next {
-            Some(p) => p.to_be_bytes(),
-            None => NULL_PAGE.to_be_bytes(),
-        });
+            buf[free..free + 2].copy_from_slice(&(k.len() as u16).to_le_bytes());
+            buf[free + 2..free + 4].copy_from_slice(&(v.len() as u16).to_le_bytes());
+            buf[free + 4..free + 4 + k.len()].copy_from_slice(k);
+            buf[free + 4 + k.len()..free + size].copy_from_slice(v);
 
-        let mut offset = 11;
-        for entry in &self.entries {
-            let key_len = entry.key.len();
-            let value_len = entry.value.len();
-
-            buf[offset..offset + 2].copy_from_slice(&(key_len as u16).to_be_bytes());
-            offset += 2;
-            buf[offset..offset + key_len].copy_from_slice(entry.key.as_bytes());
-            offset += key_len;
-            buf[offset..offset + 2].copy_from_slice(&(value_len as u16).to_be_bytes());
-            offset += 2;
-            buf[offset..offset + value_len].copy_from_slice(&entry.value);
-            offset += value_len;
+            let slot = 16 + i * 2;
+            buf[slot..slot + 2].copy_from_slice(&(free as u16).to_le_bytes());
         }
-
+        buf[3..5].copy_from_slice(&(free as u16).to_le_bytes());
         buf
     }
 
     pub fn deserialize(bytes: &[u8; PAGE_SIZE]) -> Result<Self, &'static str> {
-        if PageType::from(bytes[0]) != PageType::Leaf {
-            return Err("Not a leaf");
-        }
+        let page = SlottedPage(bytes);
+        let mut entries = Vec::with_capacity(page.cell_count());
 
-        let entries_count = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
-        let next_page = PageId::from_be_bytes(bytes[3..11].try_into().unwrap());
-
-        let mut offset = 11;
-        let mut entries: Vec<LeafEntry> = Vec::with_capacity(entries_count);
-        for _ in 0..entries_count {
-            let key_len =
-                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
-            let key: Vec<u8> = Vec::from(&bytes[offset..offset + key_len]);
-            offset += key_len;
-
-            let value_len =
-                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
-
-            let value: Vec<u8> = Vec::from(&bytes[offset..offset + value_len]);
-            offset += value_len;
-
+        for i in 0..page.cell_count() {
             entries.push(LeafEntry {
-                key: Key(key),
-                value,
-            })
+                key: Key(page.get_leaf_key(i).to_vec()),
+                value: page.get_leaf_value(i).to_vec(),
+            });
         }
 
+        let next_val = page.next_leaf();
         Ok(Leaf {
             entries,
-            next: if next_page == NULL_PAGE {
+            next: if next_val == u64::MAX {
                 None
             } else {
-                Some(next_page)
+                Some(next_val)
             },
         })
     }
@@ -230,59 +208,44 @@ impl Internal {
 
     pub fn serialize(&self) -> [u8; PAGE_SIZE] {
         let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 2; // Internal
+        buf[1..3].copy_from_slice(&(self.keys.len() as u16).to_le_bytes());
 
-        buf[0] = PageType::Internal.into();
+        let leftmost = self.children.first().copied().unwrap_or(u64::MAX);
+        buf[5..13].copy_from_slice(&leftmost.to_le_bytes());
 
-        let entries = self.keys.len() as u16;
-        buf[1..3].copy_from_slice(&entries.to_be_bytes());
+        let mut free = PAGE_SIZE;
+        for i in 0..self.keys.len() {
+            let k = self.keys[i].as_bytes();
+            let right_child = self.children[i + 1];
+            let size = 2 + k.len() + 8;
+            free -= size;
 
-        let mut offset = 3;
+            buf[free..free + 2].copy_from_slice(&(k.len() as u16).to_le_bytes());
+            buf[free + 2..free + 2 + k.len()].copy_from_slice(k);
+            buf[free + 2 + k.len()..free + size].copy_from_slice(&right_child.to_le_bytes());
 
-        for key in &self.keys {
-            let key_len = key.len();
-
-            buf[offset..offset + 2].copy_from_slice(&(key_len as u16).to_be_bytes());
-            offset += 2;
-
-            buf[offset..offset + key_len].copy_from_slice(key.as_bytes());
-            offset += key_len;
+            let slot = 16 + i * 2;
+            buf[slot..slot + 2].copy_from_slice(&(free as u16).to_le_bytes());
         }
-
-        for children in &self.children {
-            buf[offset..offset + 8].copy_from_slice(&children.to_be_bytes());
-            offset += 8;
-        }
-
+        buf[3..5].copy_from_slice(&(free as u16).to_le_bytes());
         buf
     }
 
-    pub fn deserialize(bytes: &[u8; PAGE_SIZE]) -> Result<Internal, &'static str> {
-        if PageType::from(bytes[0]) != PageType::Internal {
-            return Err("Not internal");
+    pub fn deserialize(bytes: &[u8; PAGE_SIZE]) -> Result<Self, &'static str> {
+        let page = SlottedPage(bytes);
+        let mut keys = Vec::with_capacity(page.cell_count());
+        let mut children = Vec::with_capacity(page.cell_count() + 1);
+
+        let leftmost = page.leftmost_child();
+
+        if leftmost != u64::MAX {
+            children.push(leftmost);
         }
 
-        let total_keys = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
-
-        let mut keys: Vec<Key> = Vec::with_capacity(total_keys);
-        let mut children: Vec<PageId> = Vec::with_capacity(total_keys + 1);
-
-        let mut offset = 3;
-
-        for _ in 0..total_keys {
-            let key_len =
-                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
-            let key: Key = Key(Vec::from(&bytes[offset..offset + key_len]));
-            offset += key_len;
-
-            keys.push(key);
-        }
-
-        for _ in 0..total_keys + 1 {
-            let child = PageId::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
-            offset += 8;
-
-            children.push(child);
+        for i in 0..page.cell_count() {
+            keys.push(Key(page.get_internal_key(i).to_vec()));
+            children.push(page.get_internal_child(i));
         }
 
         Ok(Internal { keys, children })
@@ -300,11 +263,6 @@ impl Node {
             Node::Leaf(leaf) => leaf.entries.len(),
             Node::Internal(internal) => internal.keys.len(),
         }
-    }
-
-    #[inline]
-    pub fn peek_key_count(bytes: &[u8; PAGE_SIZE]) -> usize {
-        u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize
     }
 
     fn is_leaf(&self) -> bool {
@@ -640,17 +598,13 @@ impl<S: Medium> BPlusTree<S> {
         let (mut current_id, mut current_guard) = loop {
             let id = self.root.load(Ordering::Acquire);
             let guard = self.pool.write(id).unwrap();
-
-            if self.root.load(Ordering::Acquire) == id {
-                break (id, guard); // Safely escape the loop with our locked root!
-            }
-            // If we don't break, `guard` is dropped right here!
+            if self.root.load(Ordering::Acquire) == id { break (id, guard); }
         };
 
-        let mut node = Node::deserialize(&current_guard.0);
-
-        // 2. Safely split the root
-        if node.key_count() == max_keys {
+        // 1. Zero-Copy Root Split Check
+        if SlottedPage(&current_guard.0).cell_count() == max_keys {
+            // We MUST split. Now we deserialize to do the heavy math.
+            let mut node = Node::deserialize(&current_guard.0);
             let new_root_id = self.allocate_internal().unwrap();
 
             let (promoted_key, right_child_id, right_node) = match &mut node {
@@ -659,10 +613,7 @@ impl<S: Medium> BPlusTree<S> {
                     let promoted_key = right_entries[0].key.clone();
 
                     let right_id = self.allocate_leaf().unwrap();
-                    let right_leaf = Leaf {
-                        entries: right_entries,
-                        next: left.next,
-                    };
+                    let right_leaf = Leaf { entries: right_entries, next: left.next };
                     left.next = Some(right_id);
 
                     (promoted_key, right_id, Node::Leaf(right_leaf))
@@ -676,10 +627,7 @@ impl<S: Medium> BPlusTree<S> {
                     let right_children = left.children.split_off(mid + 1);
 
                     let right_id = self.allocate_internal().unwrap();
-                    let right_node = Internal {
-                        keys: right_keys,
-                        children: right_children,
-                    };
+                    let right_node = Internal { keys: right_keys, children: right_children };
 
                     (promoted_key, right_id, Node::Internal(right_node))
                 }
@@ -692,23 +640,26 @@ impl<S: Medium> BPlusTree<S> {
                 keys: vec![promoted_key],
                 children: vec![current_id, right_child_id],
             };
-            self.write_node(new_root_id, &Node::Internal(new_root))
-                .unwrap();
+            self.write_node(new_root_id, &Node::Internal(new_root)).unwrap();
 
             self.root.store(new_root_id, Ordering::Release);
 
             drop(current_guard);
             current_id = new_root_id;
             current_guard = self.pool.write(current_id).unwrap();
-            // We don't need to deserialize node here because the loop does it immediately next.
         }
 
-        // 3. Monkey Bars Traversal
-        loop {
-            // FIX: MUST deserialize at the top of the loop to prevent double-locking!
-            let mut node = Node::deserialize(&current_guard.0);
+        // 2. Monkey Bars Traversal (Fast Lane!)
+        let key_bytes = key.as_bytes();
 
-            if node.is_leaf() {
+        loop {
+            // Peek at the raw bytes
+            let is_leaf = SlottedPage(&current_guard.0).is_leaf();
+
+            if is_leaf {
+                // We reached the final leaf! Deserialize only this one page to mutate it.
+                let mut node = Node::deserialize(&current_guard.0);
+
                 let inserted = if let Node::Leaf(leaf) = &mut node {
                     match leaf.find_pos(&key) {
                         Ok(i) => {
@@ -716,19 +667,11 @@ impl<S: Medium> BPlusTree<S> {
                             false
                         }
                         Err(i) => {
-                            leaf.entries.insert(
-                                i,
-                                LeafEntry {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                },
-                            );
+                            leaf.entries.insert(i, LeafEntry { key: key.clone(), value: value.clone() });
                             true
                         }
                     }
-                } else {
-                    unreachable!()
-                };
+                } else { unreachable!() };
 
                 current_guard.copy_from_slice(&node.serialize());
 
@@ -736,25 +679,21 @@ impl<S: Medium> BPlusTree<S> {
                     self.len.fetch_add(1, Ordering::Relaxed);
                 }
                 break;
-            } else {
-                let mut ci = if let Node::Internal(internal) = &node {
-                    internal.child_index(&key)
-                } else {
-                    unreachable!()
-                };
-                let mut child_id = if let Node::Internal(internal) = &node {
-                    internal.children[ci]
-                } else {
-                    unreachable!()
-                };
 
-                // Peek at the child safely
+            } else {
+                // Route through internal node directly via Slotted Bytes! (Zero Allocations)
+                let page = SlottedPage(&current_guard.0);
+                let (mut ci, mut child_id) = page.internal_route(key_bytes);
+
+                // Zero-Copy Peek at the child!
                 let child_is_full = {
                     let child_guard = self.pool.read(child_id).unwrap();
-                    Node::peek_key_count(&child_guard.0) == max_keys // Zero allocations!
+                    SlottedPage(&child_guard.0).cell_count() == max_keys
                 };
 
+                // If full, we leave the fast lane temporarily to balance
                 if child_is_full {
+                    let mut node = Node::deserialize(&current_guard.0);
                     if let Node::Internal(internal) = &mut node {
                         self.balance_window(internal, ci, self.t, max_keys);
                         ci = internal.child_index(&key);
@@ -776,33 +715,28 @@ impl<S: Medium> BPlusTree<S> {
         let (_, mut current_guard) = loop {
             let id = self.root.load(Ordering::Acquire);
             let guard = self.pool.read(id).unwrap();
-
             if self.root.load(Ordering::Acquire) == id {
-                break (id, guard); // Safely escape the loop with our locked root!
+                break (id, guard);
             }
-            // If we don't break, `guard` is dropped right here!
         };
 
+        let key_bytes = key.as_bytes();
+
         loop {
-            // Re-deserialize at the top of EVERY loop!
-            let node = Node::deserialize(&current_guard.0);
+            // ZERO ALLOCATIONS!
+            let page = SlottedPage(&current_guard.0);
 
-            match node {
-                Node::Leaf(leaf) => {
-                    return match leaf.find_pos(key) {
-                        Ok(i) => Some(leaf.entries[i].value.clone()),
-                        Err(_) => None,
-                    };
-                }
-                Node::Internal(internal) => {
-                    let ci = internal.child_index(key);
-                    let child_id = internal.children[ci];
+            if page.is_leaf() {
+                return match page.leaf_find(key_bytes) {
+                    Ok(i) => Some(page.get_leaf_value(i).to_vec()),
+                    Err(_) => None,
+                };
+            } else {
+                let (_, child_id) = page.internal_route(key_bytes);
 
-                    // Lock coupling: Grab child BEFORE dropping parent
-                    let child_guard = self.pool.read(child_id).unwrap();
-                    drop(current_guard);
-                    current_guard = child_guard;
-                }
+                let child_guard = self.pool.read(child_id).unwrap();
+                drop(current_guard);
+                current_guard = child_guard;
             }
         }
     }
@@ -811,52 +745,45 @@ impl<S: Medium> BPlusTree<S> {
         let (mut current_id, mut current_guard) = loop {
             let id = self.root.load(Ordering::Acquire);
             let guard = self.pool.write(id).unwrap();
-
-            if self.root.load(Ordering::Acquire) == id {
-                break (id, guard); // Safely escape the loop with our locked root!
-            }
-            // If we don't break, `guard` is dropped right here!
+            if self.root.load(Ordering::Acquire) == id { break (id, guard); }
         };
 
         let mut removed_value = None;
+        let key_bytes = key.as_bytes();
 
-        // 2. Monkey Bars Traversal
+        // 1. Monkey Bars Traversal (Fast Lane!)
         loop {
-            // FIX: MUST deserialize at the top of the loop!
-            let mut node = Node::deserialize(&current_guard.0);
+            let is_leaf = SlottedPage(&current_guard.0).is_leaf();
 
-            if node.is_leaf() {
+            if is_leaf {
+                // We reached the leaf! Deserialize it to remove the entry.
+                let mut node = Node::deserialize(&current_guard.0);
+
                 removed_value = if let Node::Leaf(leaf) = &mut node {
                     match leaf.find_pos(key) {
                         Ok(i) => Some(leaf.entries.remove(i).value),
                         Err(_) => None,
                     }
-                } else {
-                    unreachable!()
-                };
+                } else { unreachable!() };
 
                 if removed_value.is_some() {
                     current_guard.copy_from_slice(&node.serialize());
                 }
                 break;
             } else {
-                let mut ci = if let Node::Internal(internal) = &node {
-                    internal.child_index(key)
-                } else {
-                    unreachable!()
-                };
-                let mut child_id = if let Node::Internal(internal) = &node {
-                    internal.children[ci]
-                } else {
-                    unreachable!()
-                };
+                // Route through internal node directly via Slotted Bytes!
+                let page = SlottedPage(&current_guard.0);
+                let (mut ci, mut child_id) = page.internal_route(key_bytes);
 
+                // Zero-copy Peek at the child
                 let child_is_starving = {
                     let child_guard = self.pool.read(child_id).unwrap();
-                    Node::peek_key_count(&child_guard.0) <= self.t - 1 // Zero allocations!
+                    SlottedPage(&child_guard.0).cell_count() <= self.t - 1
                 };
 
+                // Leave the fast lane temporarily to balance
                 if child_is_starving {
+                    let mut node = Node::deserialize(&current_guard.0);
                     if let Node::Internal(internal) = &mut node {
                         self.balance_window(internal, ci, self.t, 2 * self.t - 1);
                         ci = internal.child_index(key);
@@ -872,24 +799,20 @@ impl<S: Medium> BPlusTree<S> {
             }
         }
 
+        // Must drop leaf lock before reaching for the root to prevent deadlock!
         drop(current_guard);
 
-        // 3. Bypass empty root safely
+        // 2. Bypass empty root (Zero Copy!)
         let root_id = self.root.load(Ordering::Acquire);
         let root_guard = self.pool.write(root_id).unwrap();
-        let root_node = Node::deserialize(&root_guard.0);
+        let page = SlottedPage(&root_guard.0);
 
-        if let Node::Internal(internal) = root_node {
-            if internal.keys.is_empty() {
-                let new_root_id = internal.children[0];
-                self.root.store(new_root_id, Ordering::Release);
-                drop(root_guard);
-
-                // FIX: Do NOT free the page right now. Other threads might be currently
-                // blocked in the Validation Loop trying to lock it!
-                // In a production DB, we use Epoch-Based Reclamation (EBR) to free it later.
-                // self.store.free(root_id).unwrap();
-            }
+        if !page.is_leaf() && page.cell_count() == 0 {
+            let new_root_id = page.leftmost_child();
+            self.root.store(new_root_id, Ordering::Release);
+            drop(root_guard);
+            // In production, defer freeing via Epoch-Based Reclamation
+            // self.bpm.free(root_id).unwrap();
         }
 
         if removed_value.is_some() {
