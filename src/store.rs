@@ -49,19 +49,3 @@ impl DerefMut for Page {
         &mut self.0
     }
 }
-
-pub trait PageStore {
-    type Error: std::fmt::Debug;
-
-    type ReadGuard<'a>: Deref<Target = Page>
-    where
-        Self: 'a;
-    type WriteGuard<'a>: DerefMut<Target = Page>
-    where
-        Self: 'a;
-
-    fn read(&self, id: PageId) -> Result<Self::ReadGuard<'_>, Self::Error>;
-    fn write(&self, id: PageId) -> Result<Self::WriteGuard<'_>, Self::Error>;
-    fn allocate(&self) -> Result<(PageId, Self::WriteGuard<'_>), Self::Error>;
-    fn free(&self, id: PageId) -> Result<(), Self::Error>;
-}

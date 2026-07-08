@@ -1,4 +1,5 @@
-use crate::store::{NULL_PAGE, PAGE_SIZE, PageId, PageStore, PageType};
+use crate::clock::{BpmError, BufferPoolManager, Medium};
+use crate::store::{NULL_PAGE, PAGE_SIZE, PageId, PageType};
 use std::collections::Bound;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -294,7 +295,7 @@ enum Node {
 }
 
 impl Node {
-    fn first_key<S: PageStore>(&self, store: &S) -> Option<Key> {
+    fn first_key<S: Medium>(&self, store: &BufferPoolManager<S>) -> Option<Key> {
         match self {
             Node::Leaf(leaf) => leaf.entries.first().map(|e| e.key.clone()),
             Node::Internal(internal) => {
@@ -372,60 +373,21 @@ impl From<Internal> for Node {
     }
 }
 
-#[derive(Debug)]
-pub struct BPlusTree<S: PageStore> {
+pub struct BPlusTree<S: Medium> {
     t: usize,
     root: AtomicU64,
     len: AtomicUsize,
-    store: S,
+    store: BufferPoolManager<S>,
 }
 
-impl<S: PageStore> BPlusTree<S> {
-    fn split_root_child(store: &S, old_root_id: PageId, t: usize) -> (Key, PageId) {
-        let mut old_root = Self::read_node(store, old_root_id).unwrap();
-
-        // 1. Mutate old_root and build the new right_node, returning what we need.
-        let (promoted_key, right_id, right_node) = match &mut old_root {
-            Node::Leaf(left) => {
-                let right_entries = left.entries.split_off(t);
-                let promoted_key = right_entries[0].key.clone();
-
-                let right_id = Self::allocate_leaf(store).unwrap();
-                let right_leaf = Leaf {
-                    entries: right_entries,
-                    next: left.next,
-                };
-
-                left.next = Some(right_id);
-
-                (promoted_key, right_id, Node::Leaf(right_leaf))
-            }
-            Node::Internal(left) => {
-                let mid = t - 1;
-                let promoted_key = left.keys[mid].clone();
-
-                let mut right_keys = left.keys.split_off(mid);
-                right_keys.remove(0); // Removing the promoted key entirely
-                let right_children = left.children.split_off(mid + 1);
-
-                let right_id = Self::allocate_internal(store).unwrap();
-                let right_node = Internal {
-                    keys: right_keys,
-                    children: right_children,
-                };
-
-                (promoted_key, right_id, Node::Internal(right_node))
-            }
-        };
-
-        // 2. The mutable borrow on old_root is now GONE. We can safely write it!
-        Self::write_node(store, old_root_id, &old_root).unwrap();
-        Self::write_node(store, right_id, &right_node).unwrap();
-
-        (promoted_key, right_id)
-    }
-
-    fn balance_window(parent: &mut Internal, ci: usize, t: usize, max_keys: usize, store: &S) {
+impl<S: Medium> BPlusTree<S> {
+    fn balance_window(
+        parent: &mut Internal,
+        ci: usize,
+        t: usize,
+        max_keys: usize,
+        store: &BufferPoolManager<S>,
+    ) {
         const SIBLINGS_PER_SIDE: usize = 1;
 
         let left_bound = ci.saturating_sub(SIBLINGS_PER_SIDE);
@@ -594,7 +556,7 @@ impl<S: PageStore> BPlusTree<S> {
         }
     }
 
-    fn leftmost_leaf(store: &S, node_id: PageId) -> PageId {
+    fn leftmost_leaf(store: &BufferPoolManager<S>, node_id: PageId) -> PageId {
         let node = Self::read_node(store, node_id).unwrap();
         match node {
             Node::Leaf(_) => node_id,
@@ -602,7 +564,7 @@ impl<S: PageStore> BPlusTree<S> {
         }
     }
 
-    fn find_leaf(store: &S, node_id: PageId, key: &Key) -> PageId {
+    fn find_leaf(store: &BufferPoolManager<S>, node_id: PageId, key: &Key) -> PageId {
         let mut current_id = node_id;
         loop {
             let node = Self::read_node(store, current_id).unwrap();
@@ -617,30 +579,34 @@ impl<S: PageStore> BPlusTree<S> {
     }
 }
 
-impl<S: PageStore> BPlusTree<S> {
+impl<S: Medium> BPlusTree<S> {
     // 1. Read a Node (Grabs a Read Latch, reads bytes, and DROPS the Latch instantly)
     // We only hold the read latch just long enough to copy the bytes into our memory `Node`.
-    fn read_node(store: &S, id: PageId) -> Result<Node, S::Error> {
+    fn read_node(store: &BufferPoolManager<S>, id: PageId) -> Result<Node, BpmError<S::Error>> {
         let guard = store.read(id)?;
         Ok(Node::deserialize(&guard.0))
     }
 
     // 2. Write a Node (Grabs a Write Latch, overwrites bytes, and DROPS the Latch instantly)
-    fn write_node(store: &S, id: PageId, node: &Node) -> Result<(), S::Error> {
+    fn write_node(
+        store: &BufferPoolManager<S>,
+        id: PageId,
+        node: &Node,
+    ) -> Result<(), BpmError<S::Error>> {
         let mut guard = store.write(id)?;
         let page_bytes = node.serialize();
         guard.copy_from_slice(&page_bytes);
         Ok(())
     }
 
-    pub fn allocate_leaf(store: &S) -> Result<PageId, S::Error> {
+    pub fn allocate_leaf(store: &BufferPoolManager<S>) -> Result<PageId, BpmError<S::Error>> {
         let (id, mut guard) = store.allocate()?;
         let page = Leaf::new().serialize();
         guard.copy_from_slice(&page);
         Ok(id)
     }
 
-    pub fn allocate_internal(store: &S) -> Result<PageId, S::Error> {
+    pub fn allocate_internal(store: &BufferPoolManager<S>) -> Result<PageId, BpmError<S::Error>> {
         let (id, mut guard) = store.allocate()?;
         let page = Internal::new().serialize();
         guard.copy_from_slice(&page);
@@ -648,7 +614,7 @@ impl<S: PageStore> BPlusTree<S> {
     }
 }
 
-impl<S: PageStore> BPlusTree<S> {
+impl<S: Medium> BPlusTree<S> {
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
@@ -658,8 +624,8 @@ impl<S: PageStore> BPlusTree<S> {
     }
 }
 
-impl<S: PageStore> BPlusTree<S> {
-    pub fn new(t: usize, store: S) -> Result<Self, S::Error> {
+impl<S: Medium> BPlusTree<S> {
+    pub fn new(t: usize, store: BufferPoolManager<S>) -> Result<Self, BpmError<S::Error>> {
         assert!(t >= 2, "Minimum degree must be >= 2");
 
         let root = Self::allocate_leaf(&store)?;
@@ -959,7 +925,7 @@ impl<S: PageStore> BPlusTree<S> {
     }
 }
 
-impl<S: PageStore> BPlusTree<S> {
+impl<S: Medium> BPlusTree<S> {
     pub fn print_tree(&self) {
         let root = self.root.load(Ordering::Acquire);
         let len = self.len.load(Ordering::Acquire);
@@ -967,7 +933,7 @@ impl<S: PageStore> BPlusTree<S> {
         Self::print_node(&self.store, root, 0);
     }
 
-    fn print_node(store: &S, node_id: PageId, depth: usize) {
+    fn print_node(store: &BufferPoolManager<S>, node_id: PageId, depth: usize) {
         let indent = "  ".repeat(depth);
         let node = Self::read_node(store, node_id).unwrap();
         match node {
@@ -985,16 +951,16 @@ impl<S: PageStore> BPlusTree<S> {
     }
 }
 
-pub struct LeafIter<'a, S: PageStore> {
-    store: &'a S,
+pub struct LeafIter<'a, S: Medium> {
+    store: &'a BufferPoolManager<S>,
     current_id: Option<PageId>,
     current_leaf: Option<Leaf>,
     pos: usize,
     end: Bound<Key>,
 }
 
-impl<'a, S: PageStore> LeafIter<'a, S> {
-    fn new(store: &'a S, start_id: PageId, pos: usize, end: Bound<Key>) -> Self {
+impl<'a, S: Medium> LeafIter<'a, S> {
+    fn new(store: &'a BufferPoolManager<S>, start_id: PageId, pos: usize, end: Bound<Key>) -> Self {
         LeafIter {
             store,
             current_id: Some(start_id),
@@ -1005,7 +971,7 @@ impl<'a, S: PageStore> LeafIter<'a, S> {
     }
 }
 
-impl<'a, S: PageStore> Iterator for LeafIter<'a, S> {
+impl<'a, S: Medium> Iterator for LeafIter<'a, S> {
     type Item = (Key, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1032,11 +998,11 @@ impl<'a, S: PageStore> Iterator for LeafIter<'a, S> {
                     _ => None,
                 };
 
-                if out.is_some() {
+                return if out.is_some() {
                     self.pos += 1;
-                    return out;
+                    out
                 } else {
-                    return None;
+                    None
                 }
             }
 

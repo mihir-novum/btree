@@ -1,4 +1,4 @@
-use crate::store::{PAGE_SIZE, Page, PageId, PageStore};
+use crate::store::{PAGE_SIZE, Page, PageId};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -116,6 +116,7 @@ struct FrameMeta {
     dirty: bool,
 }
 
+
 pub struct BufferPoolManager<M: Medium> {
     medium: M,
     data: Vec<RwLock<Page>>,
@@ -155,7 +156,6 @@ impl<M: Medium> BufferPoolManager<M> {
     }
 
     fn fetch_frame(&self, page_id: PageId) -> Result<usize, BpmError<M::Error>> {
-        // 1. Keep the Page Table locked during the victim selection
         let mut pt = self.page_table.lock();
 
         // cache hit
@@ -173,8 +173,6 @@ impl<M: Medium> BufferPoolManager<M> {
 
             let mut meta = self.meta[victim_id].lock();
             if meta.dirty {
-                // It's safe to read the old data here because it's unpinned,
-                // so no other thread is holding a Write/Read lock on it!
                 let old_data = self.data[victim_id].read();
                 self.medium
                     .write_page(meta.page_id.unwrap(), &old_data)
@@ -188,17 +186,12 @@ impl<M: Medium> BufferPoolManager<M> {
             victim_id
         };
 
-        // 2. CLAIM THE PAGE IN THE TABLE BEFORE DOING I/O!
+        // FIX 1: Claim the page table entry before I/O, then drop the lock!
         pt.insert(page_id, frame_id);
-
-        // 3. Drop the page table lock so other threads can keep working
         drop(pt);
 
-        // 4. Lock the actual Frame Data for writing.
-        // If Thread B gets a cache hit on this page, they will politely
-        // wait here for us to finish the disk I/O!
+        // Block other threads from reading this frame while we do disk I/O
         let mut frame_data = self.data[frame_id].write();
-
         let fresh = self.medium.read_page(page_id).map_err(BpmError::Medium)?;
         *frame_data = fresh;
 
@@ -218,8 +211,51 @@ impl<M: Medium> BufferPoolManager<M> {
             self.replacer.lock().unpin(frame_id);
         }
     }
-}
 
+    // -------------------------------------------------------------
+    // Direct API (Moved from the old Trait)
+    // -------------------------------------------------------------
+
+    pub fn read(&self, id: PageId) -> Result<ReadGuard<'_, M>, BpmError<M::Error>> {
+        let frame_id = self.fetch_frame(id)?;
+        let inner = self.data[frame_id].read();
+        Ok(ReadGuard {
+            pool: self,
+            frame_id,
+            inner,
+        })
+    }
+
+    pub fn write(&self, id: PageId) -> Result<WriteGuard<'_, M>, BpmError<M::Error>> {
+        let frame_id = self.fetch_frame(id)?;
+        let inner = self.data[frame_id].write();
+        Ok(WriteGuard {
+            pool: self,
+            frame_id,
+            inner,
+        })
+    }
+
+    pub fn allocate(&self) -> Result<(PageId, WriteGuard<'_, M>), BpmError<M::Error>> {
+        let id = self.medium.allocate_page().map_err(BpmError::Medium)?;
+        Ok((id, self.write(id)?))
+    }
+
+    pub fn free(&self, id: PageId) -> Result<(), BpmError<M::Error>> {
+        self.medium.free_page(id).map_err(BpmError::Medium)?;
+
+        // FIX 2: Evict the page from the buffer pool if it's currently in memory
+        let mut pt = self.page_table.lock();
+        if let Some(frame_id) = pt.remove(&id) {
+            let mut meta = self.meta[frame_id].lock();
+            meta.page_id = None;
+            meta.dirty = false;
+            // Push back to free list to recycle the RAM instantly
+            self.free_list.lock().push(frame_id);
+        }
+        Ok(())
+    }
+}
 // ─────────────────────────────────────────────────────────────
 // Guards
 // ─────────────────────────────────────────────────────────────
@@ -266,60 +302,6 @@ impl<'a, M: Medium> Drop for WriteGuard<'a, M> {
 // ─────────────────────────────────────────────────────────────
 // PageStore impl
 // ─────────────────────────────────────────────────────────────
-
-impl<M: Medium> PageStore for BufferPoolManager<M> {
-    type Error = BpmError<M::Error>;
-    type ReadGuard<'a>
-        = ReadGuard<'a, M>
-    where
-        Self: 'a;
-    type WriteGuard<'a>
-        = WriteGuard<'a, M>
-    where
-        Self: 'a;
-
-    fn read(&self, id: PageId) -> Result<Self::ReadGuard<'_>, Self::Error> {
-        let frame_id = self.fetch_frame(id)?;
-        let inner = self.data[frame_id].read();
-        Ok(ReadGuard {
-            pool: self,
-            frame_id,
-            inner,
-        })
-    }
-
-    fn write(&self, id: PageId) -> Result<Self::WriteGuard<'_>, Self::Error> {
-        let frame_id = self.fetch_frame(id)?;
-        let inner = self.data[frame_id].write();
-        Ok(WriteGuard {
-            pool: self,
-            frame_id,
-            inner,
-        })
-    }
-
-    fn allocate(&self) -> Result<(PageId, Self::WriteGuard<'_>), Self::Error> {
-        let id = self.medium.allocate_page().map_err(BpmError::Medium)?;
-        Ok((id, self.write(id)?))
-    }
-
-    fn free(&self, id: PageId) -> Result<(), Self::Error> {
-        self.medium.free_page(id).map_err(BpmError::Medium)?;
-
-        // Remove it from the cache if it is currently in memory!
-        let mut pt = self.page_table.lock();
-        if let Some(frame_id) = pt.remove(&id) {
-            let mut meta = self.meta[frame_id].lock();
-            meta.page_id = None;
-            meta.dirty = false;
-
-            // Note: In a production DB, you would also push this frame_id
-            // back onto the `free_list` here to recycle the RAM immediately!
-        }
-
-        Ok(())
-    }
-}
 
 #[derive(Debug)]
 pub enum FileMediumError {
