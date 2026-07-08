@@ -263,7 +263,35 @@ impl<M: Medium> BufferPoolManager<M> {
         }
         Ok(())
     }
+
+    pub fn flush_all(&self) -> Result<(), BpmError<M::Error>> {
+        for frame_id in 0..self.data.len() {
+            let mut meta = self.meta[frame_id].lock();
+            if meta.dirty {
+                if let Some(page_id) = meta.page_id {
+                    let data = self.data[frame_id].read();
+                    self.medium
+                        .write_page(page_id, &data)
+                        .map_err(BpmError::Medium)?;
+                    meta.dirty = false;
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+impl<M: Medium> Drop for BufferPoolManager<M> {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_all() {
+            // Drop can't propagate errors, so this is a last-resort
+            // backstop, not a substitute for calling flush_all()
+            // explicitly and handling the Result yourself.
+            eprintln!("BufferPoolManager: flush_all failed during drop: {:?}", e);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Guards
 // ─────────────────────────────────────────────────────────────
@@ -356,6 +384,7 @@ impl Medium for FilePageMedium {
     type Error = FileMediumError;
 
     fn read_page(&self, id: PageId) -> Result<Page, Self::Error> {
+
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(Self::offset(id)))?;
 
