@@ -904,13 +904,15 @@ impl<S: Medium> BPlusTree<S> {
         removed_value
     }
 
-    pub fn iter(&self) -> LeafIter<'_, S> {
+    pub fn iter(&self) -> LeafIter<'_> {
         let root = self.root.load(Ordering::Acquire);
         let leaf_id = Self::leftmost_leaf(&self.store, root);
-        LeafIter::new(&self.store, leaf_id, 0, Bound::Unbounded)
+
+        // Passing `self` automatically acts as the `&dyn PageProvider`!
+        LeafIter::new(self, leaf_id, 0, Bound::Unbounded)
     }
 
-    pub fn range_from(&self, start: &Key, end: Bound<Key>) -> LeafIter<'_, S> {
+    pub fn range_from(&self, start: &Key, end: Bound<Key>) -> LeafIter<'_> {
         let root = self.root.load(Ordering::Acquire);
         let leaf_id = Self::find_leaf(&self.store, root, start);
 
@@ -921,7 +923,7 @@ impl<S: Medium> BPlusTree<S> {
             0
         };
 
-        LeafIter::new(&self.store, leaf_id, pos, end)
+        LeafIter::new(self, leaf_id, pos, end)
     }
 }
 
@@ -951,18 +953,41 @@ impl<S: Medium> BPlusTree<S> {
     }
 }
 
-pub struct LeafIter<'a, S: Medium> {
-    store: &'a BufferPoolManager<S>,
+trait PageProvider {
+    fn fetch_leaf(&self, id: PageId) -> Option<Leaf>;
+    fn prefetch_leaf(&self, id: PageId);
+}
+
+impl<M: Medium> PageProvider for BPlusTree<M> {
+    fn fetch_leaf(&self, id: PageId) -> Option<Leaf> {
+        let node = Self::read_node(&self.store, id).ok()?;
+        if let Node::Leaf(leaf) = node {
+            Some(leaf)
+        } else {
+            None
+        }
+    }
+
+    fn prefetch_leaf(&self, id: PageId) {
+        // Just calling `read` brings the page into the Buffer Pool.
+        // It drops immediately, so it doesn't hold any locks!
+        // (In an async DB, you would spawn a background task here)
+        let _ = self.store.read(id);
+    }
+}
+
+pub struct LeafIter<'a> {
+    provider: &'a dyn PageProvider, // <-- Completely hides the Medium!
     current_id: Option<PageId>,
     current_leaf: Option<Leaf>,
     pos: usize,
     end: Bound<Key>,
 }
 
-impl<'a, S: Medium> LeafIter<'a, S> {
-    fn new(store: &'a BufferPoolManager<S>, start_id: PageId, pos: usize, end: Bound<Key>) -> Self {
+impl<'a> LeafIter<'a> {
+    fn new(provider: &'a dyn PageProvider, start_id: PageId, pos: usize, end: Bound<Key>) -> Self {
         LeafIter {
-            store,
+            provider,
             current_id: Some(start_id),
             current_leaf: None,
             pos,
@@ -971,23 +996,27 @@ impl<'a, S: Medium> LeafIter<'a, S> {
     }
 }
 
-impl<'a, S: Medium> Iterator for LeafIter<'a, S> {
+impl<'a> Iterator for LeafIter<'a> {
     type Item = (Key, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            // 1. Fetch the leaf if we don't have one
             if self.current_leaf.is_none() {
                 let id = self.current_id?;
-                let node = BPlusTree::<S>::read_node(self.store, id).ok()?;
-                if let Node::Leaf(leaf) = node {
-                    self.current_leaf = Some(leaf);
-                } else {
-                    return None;
+                let leaf = self.provider.fetch_leaf(id)?;
+
+                // Trigger the load for the next page so it's ready when we need it
+                if let Some(next_id) = leaf.next {
+                    self.provider.prefetch_leaf(next_id);
                 }
+
+                self.current_leaf = Some(leaf);
             }
 
             let leaf = self.current_leaf.as_ref().unwrap();
 
+            // 2. Yield items from the current leaf
             if self.pos < leaf.entries.len() {
                 let e = &leaf.entries[self.pos];
 
@@ -1003,9 +1032,10 @@ impl<'a, S: Medium> Iterator for LeafIter<'a, S> {
                     out
                 } else {
                     None
-                }
+                };
             }
 
+            // 3. Move forward
             self.current_id = leaf.next;
             self.current_leaf = None;
             self.pos = 0;
